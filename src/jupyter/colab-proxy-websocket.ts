@@ -18,6 +18,8 @@ import {
   COLAB_RUNTIME_PROXY_TOKEN_HEADER,
 } from '../colab/headers';
 import { log } from '../common/logging';
+import { telemetry } from '../telemetry';
+import { withErrorTracking } from '../telemetry/wrappers';
 import { ColabAssignedServer } from './servers';
 
 /**
@@ -68,37 +70,12 @@ export function colabProxyWebSocket(
       this.addListener(
         'message',
         (data: WebSocket.RawData, isBinary: boolean) => {
-          if (!isBinary && typeof data === 'string') {
-            let message: unknown;
-            try {
-              message = JSON.parse(data) as unknown;
-            } catch (e: unknown) {
-              log.warn('Failed to parse received Jupyter message to JSON:', e);
-              return;
-            }
-
-            if (isColabAuthEphemeralRequest(message)) {
-              log.trace('Colab request message received:', message);
-              handleEphemeralAuthFn(
-                vs,
-                apiClient,
-                server,
-                message.content.request.authType,
-              )
-                .then(() => {
-                  this.sendInputReply(message.metadata.colab_msg_id);
-                })
-                .catch((err: unknown) => {
-                  log.error('Failed handling ephemeral auth propagation', err);
-                  this.sendInputReply(message.metadata.colab_msg_id, err);
-                });
-            }
-          }
+          withErrorTracking(this.handleMessage.bind(this))(data, isBinary);
         },
       );
     }
 
-    dispose() {
+    dispose(): void {
       if (this.disposed) {
         return;
       }
@@ -110,7 +87,15 @@ export function colabProxyWebSocket(
       data: BufferLike,
       options?: SendOptions | ((err?: Error) => void),
       cb?: (err?: Error) => void,
-    ) {
+    ): void {
+      withErrorTracking(this.sendInternal.bind(this))(data, options, cb);
+    }
+
+    private sendInternal(
+      data: BufferLike,
+      options?: SendOptions | ((err?: Error) => void),
+      cb?: (err?: Error) => void,
+    ): void {
       this.guardDisposed();
 
       if (typeof data === 'string' && !this.clientSessionId) {
@@ -132,7 +117,37 @@ export function colabProxyWebSocket(
       super.send(data, options, cb);
     }
 
-    private sendInputReply(requestMessageId: number, err?: unknown) {
+    private handleMessage(data: WebSocket.RawData, isBinary: boolean): void {
+      if (!isBinary && typeof data === 'string') {
+        let message: unknown;
+        try {
+          message = JSON.parse(data) as unknown;
+        } catch (e: unknown) {
+          log.warn('Failed to parse received Jupyter message to JSON:', e);
+          return;
+        }
+
+        if (isColabAuthEphemeralRequest(message)) {
+          log.trace('Colab request message received:', message);
+          handleEphemeralAuthFn(
+            vs,
+            apiClient,
+            server,
+            message.content.request.authType,
+          )
+            .then(() => {
+              this.sendInputReply(message.metadata.colab_msg_id);
+            })
+            .catch((err: unknown) => {
+              log.error('Failed handling ephemeral auth propagation', err);
+              telemetry.logError(err);
+              this.sendInputReply(message.metadata.colab_msg_id, err);
+            });
+        }
+      }
+    }
+
+    private sendInputReply(requestMessageId: number, err?: unknown): void {
       // Client session ID should be set already at this point.
       assert(this.clientSessionId);
       const replyMessage: ColabInputReplyMessage = {
