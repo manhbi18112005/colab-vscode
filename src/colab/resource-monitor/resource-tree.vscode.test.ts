@@ -5,7 +5,7 @@
  */
 
 import { assert, expect } from 'chai';
-import sinon, { SinonStubbedInstance } from 'sinon';
+import sinon, { SinonFakeTimers, SinonStubbedInstance } from 'sinon';
 import { Uri } from 'vscode';
 import { AuthChangeEvent } from '../../auth/auth-provider';
 import {
@@ -14,8 +14,9 @@ import {
 } from '../../jupyter/assignments';
 import { ColabAssignedServer } from '../../jupyter/servers';
 import { TestEventEmitter } from '../../test/helpers/events';
-import { Disk, GpuInfo, Memory } from '../api';
+import { ExperimentFlag, Disk, GpuInfo, Memory } from '../api';
 import { ColabClient } from '../client';
+import { TEST_ONLY as FLAGS_TEST_ONLY } from '../experiment-state';
 import { ResourceItem } from './resource-item';
 import { ResourceTreeProvider } from './resource-tree';
 
@@ -46,6 +47,8 @@ const DEFAULT_GPU: GpuInfo = {
   memoryTotalBytes: 20 * 1024 * 1024 * 1024,
   memoryUsedBytes: 10 * 1024 * 1024 * 1024,
 };
+
+const TEST_RESOURCE_POLL_INTERVAL_MS = 5000;
 
 describe('ResourceTreeProvider', () => {
   let assignmentStub: SinonStubbedInstance<AssignmentManager>;
@@ -80,6 +83,10 @@ describe('ResourceTreeProvider', () => {
     authChangeEmitter = new TestEventEmitter<AuthChangeEvent>();
     assignmentChangeEmitter = new TestEventEmitter<AssignmentChangeEvent>();
 
+    FLAGS_TEST_ONLY.setFlagForTest(
+      ExperimentFlag.ResourcePollIntervalMs,
+      TEST_RESOURCE_POLL_INTERVAL_MS,
+    );
     tree = new ResourceTreeProvider(
       assignmentStub,
       assignmentChangeEmitter.event,
@@ -89,6 +96,8 @@ describe('ResourceTreeProvider', () => {
   });
 
   afterEach(() => {
+    FLAGS_TEST_ONLY.resetFlagsForTest();
+    tree.dispose();
     sinon.restore();
   });
 
@@ -208,6 +217,58 @@ describe('ResourceTreeProvider', () => {
             ResourceItem.fromServer(secondServer),
           ]);
         });
+      });
+    });
+  });
+
+  describe('refresh', () => {
+    it('fires an undefined change event', () => {
+      const changeSpy = sinon.spy();
+      tree.onDidChangeTreeData(changeSpy);
+
+      tree.refresh();
+
+      sinon.assert.calledOnceWithExactly(changeSpy, undefined);
+    });
+  });
+
+  describe('refresh polling', () => {
+    let clock: SinonFakeTimers;
+    let refreshSpy: sinon.SinonSpy;
+
+    beforeEach(() => {
+      clock = sinon.useFakeTimers();
+      refreshSpy = sinon.spy(tree, 'refresh');
+    });
+
+    afterEach(() => {
+      clock.restore();
+    });
+
+    it('does not trigger refresh while unauthorized', () => {
+      clock.tick(TEST_RESOURCE_POLL_INTERVAL_MS + 1);
+
+      sinon.assert.notCalled(refreshSpy);
+    });
+
+    describe('while authorized', () => {
+      beforeEach(() => {
+        toggleAuth(AuthState.SIGNED_IN);
+        refreshSpy.resetHistory();
+      });
+
+      it('triggers refresh at interval', () => {
+        clock.tick(TEST_RESOURCE_POLL_INTERVAL_MS + 1);
+
+        sinon.assert.calledOnce(refreshSpy);
+      });
+
+      it('does not trigger refresh after disposed', () => {
+        tree.dispose();
+
+        clock.tick(TEST_RESOURCE_POLL_INTERVAL_MS + 1);
+
+        sinon.assert.notCalled(refreshSpy);
       });
     });
   });

@@ -12,11 +12,14 @@ import {
   TreeItem,
 } from 'vscode';
 import { AuthChangeEvent } from '../../auth/auth-provider';
+import { OverrunPolicy, SequentialTaskRunner } from '../../common/task-runner';
 import {
   AssignmentChangeEvent,
   AssignmentManager,
 } from '../../jupyter/assignments';
+import { ExperimentFlag } from '../api';
 import { ColabClient } from '../client';
+import { getFlag } from '../experiment-state';
 import { ResourceItem, ResourceType } from './resource-item';
 
 /**
@@ -35,6 +38,7 @@ export class ResourceTreeProvider
 
   private readonly assignmentListener: Disposable;
   private readonly authListener: Disposable;
+  private readonly refreshRunner?: SequentialTaskRunner;
   // Cache of resource items by server endpoint to avoid invoking resource API
   // too frequently.
   private resourceItemsByEndpoint = new Map<string, ResourceItem[]>();
@@ -58,6 +62,29 @@ export class ResourceTreeProvider
     // TODO: Handle rapid assignment changes and race conditions
     this.assignmentListener = assignmentChange(this.refresh.bind(this));
     this.authListener = authChange(this.handleAuthChange.bind(this));
+
+    // Read poll interval from experiment config once at runner initialization.
+    const refreshIntervalMs = getFlag(ExperimentFlag.ResourcePollIntervalMs);
+    if (typeof refreshIntervalMs === 'number') {
+      this.refreshRunner = new SequentialTaskRunner(
+        {
+          intervalTimeoutMs: Math.max(
+            refreshIntervalMs,
+            MIN_REFRESH_INTERVAL_MS,
+          ),
+          taskTimeoutMs: REFRESH_TIMEOUT_MS,
+          abandonGraceMs: 0, // Nothing to cleanup, abandon immediately.
+        },
+        {
+          name: ResourceTreeProvider.name,
+          run: () => {
+            this.refresh.call(this);
+            return Promise.resolve();
+          },
+        },
+        OverrunPolicy.AllowToComplete,
+      );
+    }
   }
 
   /**
@@ -67,6 +94,7 @@ export class ResourceTreeProvider
     if (this.isDisposed) {
       return;
     }
+    this.refreshRunner?.dispose();
     this.authListener.dispose();
     this.assignmentListener.dispose();
     this.resourceItemsByEndpoint.clear();
@@ -144,6 +172,11 @@ export class ResourceTreeProvider
     }
     this.isAuthorized = e.hasValidSession;
     this.refresh();
+    if (this.isAuthorized) {
+      this.refreshRunner?.start();
+    } else {
+      this.refreshRunner?.stop();
+    }
   }
 
   private guardDisposed() {
@@ -154,3 +187,7 @@ export class ResourceTreeProvider
     }
   }
 }
+
+// The refresh() call should be instant, but giving it a 2s timeout to be safe.
+const REFRESH_TIMEOUT_MS = 2000; // 2 seconds.
+const MIN_REFRESH_INTERVAL_MS = 5000; // 5 seconds.
