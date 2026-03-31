@@ -47,8 +47,14 @@ import { initializeLogger, log } from './common/logging';
 import { Toggleable } from './common/toggleable';
 import { getPackageInfo } from './config/package-info';
 import { DriveClient } from './drive/client';
-import { IMPORT_NOTEBOOK_FROM_URL } from './drive/commands/constants';
-import { importNotebookFromUrl } from './drive/commands/import';
+import {
+  IMPORT_DRIVE_FILE_PATH,
+  IMPORT_NOTEBOOK_FROM_URL,
+} from './drive/commands/constants';
+import {
+  handleImportUriEvents,
+  importNotebookFromUrl,
+} from './drive/commands/import';
 import { AssignmentManager } from './jupyter/assignments';
 import { ContentsFileSystemProvider } from './jupyter/contents/file-system';
 import { JupyterConnectionManager } from './jupyter/contents/sessions';
@@ -196,6 +202,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
       fs,
       driveClient,
     ),
+    handleUriEvents(uriHandler.onReceivedUri),
   );
   telemetry.logActivation();
 }
@@ -324,6 +331,23 @@ function registerCommand<T extends (...args: Parameters<T>) => ReturnType<T>>(
   handler: T,
 ): Disposable {
   return vscode.commands.registerCommand(command, withErrorTracking(handler));
+}
+
+/**
+ * Handles incoming URI events to the extension.
+ *
+ * @param onReceivedUri - Event listener for Uri events
+ * @returns Disposable which stops listening to URI events on disposal.
+ */
+function handleUriEvents(onReceivedUri: vscode.Event<vscode.Uri>): Disposable {
+  const supportedPaths = [IMPORT_DRIVE_FILE_PATH];
+  return onReceivedUri((uri) => {
+    if (!supportedPaths.includes(uri.path.slice(1))) {
+      return;
+    }
+
+    handleImportUriEvents(vscode, uri);
+  });
 }
 
 function disposeAll(items: { dispose?: () => void }[]): Disposable {
