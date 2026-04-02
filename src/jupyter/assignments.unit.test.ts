@@ -1201,6 +1201,70 @@ describe('AssignmentManager', () => {
           sinon.match(/notebooks Colab GPU A100 was/),
         );
       });
+
+      it('keeps the server tracked if deleting a session fails', async () => {
+        const session = {
+          id: 'mock-session-id-1',
+          kernel: {
+            id: 'mock-kernel-id',
+            name: 'mock-kernel-name',
+            lastActivity: new Date().toISOString(),
+            executionState: 'idle',
+            connections: 1,
+          },
+          name: 'mock-session-name',
+          path: 'mock-path',
+          type: 'notebook',
+        };
+        jupyterStub.sessions.list.resolves([session]);
+        jupyterStub.sessions.delete.rejects(new Error('delete failed'));
+
+        await expect(
+          assignmentManager.unassignServer(defaultServer),
+        ).to.be.rejectedWith('delete failed');
+
+        const serversAfter =
+          await assignmentManager.getLastKnownAssignedServers();
+        expect(serversAfter).to.deep.equal([
+          {
+            id: defaultServer.id,
+            label: defaultServer.label,
+            variant: defaultServer.variant,
+            accelerator: defaultServer.accelerator,
+            endpoint: defaultServer.endpoint,
+            dateAssigned: defaultServer.dateAssigned,
+          },
+        ]);
+        sinon.assert.notCalled(colabClientStub.unassign);
+        sinon.assert.notCalled(assignmentChangeListener);
+      });
+
+      it('keeps the server tracked if remote unassign fails', async () => {
+        jupyterStub.sessions.list.resolves([]);
+        colabClientStub.unassign.rejects(new Error('unassign failed'));
+
+        await expect(
+          assignmentManager.unassignServer(defaultServer),
+        ).to.be.rejectedWith('unassign failed');
+
+        const serversAfter =
+          await assignmentManager.getLastKnownAssignedServers();
+        expect(serversAfter).to.deep.equal([
+          {
+            id: defaultServer.id,
+            label: defaultServer.label,
+            variant: defaultServer.variant,
+            accelerator: defaultServer.accelerator,
+            endpoint: defaultServer.endpoint,
+            dateAssigned: defaultServer.dateAssigned,
+          },
+        ]);
+        sinon.assert.calledOnceWithMatch(
+          colabClientStub.unassign,
+          defaultServer.endpoint,
+        );
+        sinon.assert.notCalled(assignmentChangeListener);
+      });
     });
 
     describe('when an unowned server exists', () => {
