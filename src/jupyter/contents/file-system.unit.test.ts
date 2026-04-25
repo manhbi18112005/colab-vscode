@@ -696,6 +696,21 @@ describe('ContentsFileSystemProvider', () => {
       sinon.assert.notCalled(contentsStub.get);
     });
 
+    it('stops polling when the provider is disposed', async () => {
+      const { contentsStub } = stubWatchedRootDirectory();
+      fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: false,
+        excludes: [],
+      });
+      await flushWatchRun();
+      contentsStub.get.resetHistory();
+
+      fs.dispose();
+      await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+      sinon.assert.notCalled(contentsStub.get);
+    });
+
     describe('file watch', () => {
       function stubWatchedFile(
         endpoint: string,
@@ -1151,6 +1166,102 @@ describe('ContentsFileSystemProvider', () => {
           watch.dispose();
         }).to.not.throw();
       });
+
+      it('skips a watch removed after the current poll cycle starts', async () => {
+        const fooContentsStub = stubClient('m-s-foo');
+        const barContentsStub = stubClient('m-s-bar');
+        fooContentsStub.get
+          .withArgs({ path: '/foo.txt', content: 0 })
+          .resolves(FOO_CONTENT_FILE);
+        barContentsStub.get
+          .withArgs({ path: '/bar.txt', content: 0 })
+          .resolves({ ...FOO_CONTENT_FILE, path: '/bar.txt' });
+
+        fs.watch(TestUri.parse('colab://m-s-foo/foo.txt'), {
+          recursive: false,
+          excludes: [],
+        });
+        fs.watch(TestUri.parse('colab://m-s-bar/bar.txt'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        let resolveFooMetadata!: (content: Contents) => void;
+        const fooMetadata = new Promise<Contents>((resolve) => {
+          resolveFooMetadata = resolve;
+        });
+        fooContentsStub.get.resetHistory();
+        barContentsStub.get.resetHistory();
+        fooContentsStub.get
+          .withArgs({ path: '/foo.txt', content: 0 })
+          .returns(fooMetadata);
+
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        connectionEmitter.fire(['m-s-bar']);
+        resolveFooMetadata(FOO_CONTENT_FILE);
+        await flushWatchRun();
+
+        sinon.assert.notCalled(barContentsStub.get);
+      });
+
+      it('does not emit events for a watch disposed during its poll', async () => {
+        const contentsStub = stubClient('m-s-foo');
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/foo.txt' && request.content === 0) {
+            return Promise.resolve(FOO_CONTENT_FILE);
+          }
+          if (request.path === '/bar.txt' && request.content === 0) {
+            return Promise.resolve({ ...FOO_CONTENT_FILE, path: '/bar.txt' });
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+        const fooWatch = fs.watch(TestUri.parse('colab://m-s-foo/foo.txt'), {
+          recursive: false,
+          excludes: [],
+        });
+        fs.watch(TestUri.parse('colab://m-s-foo/bar.txt'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        let resolveFooMetadata!: (content: Contents) => void;
+        const fooMetadata = new Promise<Contents>((resolve) => {
+          resolveFooMetadata = resolve;
+        });
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/foo.txt' && request.content === 0) {
+            return fooMetadata;
+          }
+          if (request.path === '/bar.txt' && request.content === 0) {
+            return Promise.resolve({ ...FOO_CONTENT_FILE, path: '/bar.txt' });
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+        listener.resetHistory();
+
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+        fooWatch.dispose();
+        resolveFooMetadata({
+          ...FOO_CONTENT_FILE,
+          lastModified: '2026-01-01T00:00:00Z',
+        });
+        await flushWatchRun();
+
+        sinon.assert.notCalled(listener);
+      });
     });
 
     describe('covered roots deduplication', () => {
@@ -1333,6 +1444,88 @@ describe('ContentsFileSystemProvider', () => {
           {
             type: FileChangeType.Created,
             uri: uriStringMatch('colab://m-s-foo/foo/bar.txt'),
+          },
+        ]);
+      });
+
+      it('preserves watches across transient poll failures', async () => {
+        const contentsStub = stubClient('m-s-foo');
+        let rootContents: DirectoryContents = {
+          ...ROOT_CONTENT_DIR,
+          type: 'directory',
+          content: [],
+        };
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/' && request.content === 0) {
+            return Promise.resolve(ROOT_CONTENT_DIR);
+          }
+          if (
+            request.path === '/' &&
+            request.type === ContentsGetTypeEnum.Directory
+          ) {
+            return Promise.resolve(rootContents);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+
+        fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/' && request.content === 0) {
+            return Promise.resolve(ROOT_CONTENT_DIR);
+          }
+          if (
+            request.path === '/' &&
+            request.type === ContentsGetTypeEnum.Directory
+          ) {
+            return Promise.reject(new Error('temporary network failure'));
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+        sinon.assert.notCalled(listener);
+
+        rootContents = {
+          ...ROOT_CONTENT_DIR,
+          type: 'directory',
+          content: [FOO_CONTENT_FILE],
+        };
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/' && request.content === 0) {
+            return Promise.resolve(ROOT_CONTENT_DIR);
+          }
+          if (
+            request.path === '/' &&
+            request.type === ContentsGetTypeEnum.Directory
+          ) {
+            return Promise.resolve(rootContents);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Created,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
           },
         ]);
       });
