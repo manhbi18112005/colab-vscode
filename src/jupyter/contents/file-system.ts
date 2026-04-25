@@ -14,17 +14,25 @@ import vscode, {
   FileSystemProvider,
   FileType,
   Uri,
+  WorkspaceConfiguration,
   WorkspaceFoldersChangeEvent,
 } from 'vscode';
 import { buildColabFileUri } from '../../colab/files';
 import { log } from '../../common/logging';
 import { traceMethod } from '../../common/logging/decorators';
 import {
+  OverrunPolicy,
+  SequentialTaskRunner,
+  StartMode,
+} from '../../common/task-runner';
+import {
+  DirectoryContents,
   isDirectoryContents,
   toFileStat,
   toFileType,
 } from '../client/converters';
 import {
+  Contents,
   ContentsApi,
   ContentsGetFormatEnum,
   ContentsGetTypeEnum,
@@ -33,6 +41,130 @@ import {
 } from '../client/generated';
 import { ColabAssignedServer } from '../servers';
 import { JupyterConnectionManager } from './sessions';
+
+const WATCH_POLL_INTERVAL_MS = 1000 * 5;
+const WATCH_TASK_TIMEOUT_MS = 1000 * 10;
+const MAX_WATCH_DEPTH = 20;
+const WATCH_SNAPSHOT_REQUEST_CONCURRENCY = 5;
+const MAX_WATCH_SNAPSHOT_ENTRIES = 5000;
+
+interface WatchConfig {
+  readonly pollIntervalMs: number;
+  readonly snapshotRequestConcurrency: number;
+  readonly maxSnapshotEntries: number;
+}
+
+interface FileSnapshot {
+  readonly mtime: number;
+  readonly size: number;
+}
+
+interface SnapshotEntry {
+  readonly uri: Uri;
+  readonly type: FileType;
+  readonly mtime: number;
+  readonly size: number;
+}
+
+type DirectorySnapshot = ReadonlyMap<string, SnapshotEntry>;
+type WatchKind = 'directory' | 'file';
+type WatchSnapshot = DirectorySnapshot | FileSnapshot;
+
+function isFileSnapshot(snapshot: WatchSnapshot): snapshot is FileSnapshot {
+  return !isDirectorySnapshot(snapshot);
+}
+
+function isDirectorySnapshot(
+  snapshot: WatchSnapshot,
+): snapshot is DirectorySnapshot {
+  return snapshot instanceof Map;
+}
+
+type CurrentWatchState =
+  | { readonly skipped: true }
+  | { readonly present: false; readonly skipped?: false }
+  | {
+      readonly kind: 'directory';
+      readonly present: true;
+      readonly snapshot: DirectorySnapshot;
+      readonly skipped?: false;
+    }
+  | {
+      readonly kind: 'file';
+      readonly present: true;
+      readonly snapshot: FileSnapshot;
+      readonly skipped?: false;
+    };
+
+interface WatchState {
+  readonly uri: Uri;
+  readonly recursive: boolean;
+  refCount: number;
+  initialized: boolean;
+  present: boolean;
+  kind?: WatchKind;
+  snapshot?: WatchSnapshot;
+}
+
+interface PendingDirectorySnapshot {
+  readonly uri: Uri;
+  readonly contents: DirectoryContents;
+  readonly remainingDepth: number;
+}
+
+interface PendingDirectoryRequest {
+  readonly uri: Uri;
+  readonly remainingDepth: number;
+}
+
+interface SnapshotCollectionBudget {
+  entryCount: number;
+}
+
+function readWatchConfig(
+  config?: Pick<WorkspaceConfiguration, 'get'>,
+): WatchConfig {
+  return {
+    pollIntervalMs: readPositiveInteger(
+      config,
+      'fileWatchPollIntervalMs',
+      WATCH_POLL_INTERVAL_MS,
+    ),
+    snapshotRequestConcurrency: readPositiveInteger(
+      config,
+      'fileWatchSnapshotRequestConcurrency',
+      WATCH_SNAPSHOT_REQUEST_CONCURRENCY,
+    ),
+    maxSnapshotEntries: readPositiveInteger(
+      config,
+      'fileWatchMaxSnapshotEntries',
+      MAX_WATCH_SNAPSHOT_ENTRIES,
+    ),
+  };
+}
+
+function readPositiveInteger(
+  config: Pick<WorkspaceConfiguration, 'get'> | undefined,
+  key: string,
+  defaultValue: number,
+): number {
+  if (!config) {
+    return defaultValue;
+  }
+  const value = config.get<number>(key, defaultValue);
+  if (!Number.isFinite(value) || value < 1) {
+    return defaultValue;
+  }
+  return Math.floor(value);
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected watch state: ${JSON.stringify(value)}`);
+}
+
+function isAborted(signal: AbortSignal): boolean {
+  return signal.aborted;
+}
 
 /**
  * Defines what VS Code needs to read, write, discover and manage files and
@@ -68,6 +200,9 @@ export class ContentsFileSystemProvider
   private readonly changeEmitter: EventEmitter<FileChangeEvent[]>;
   private readonly workspaceListener: Disposable;
   private readonly connectionListener: Disposable;
+  private readonly watchRunner: SequentialTaskRunner;
+  private readonly watchConfig: WatchConfig;
+  private readonly watches = new Map<string, WatchState>();
 
   /**
    * Initializes a new instance.
@@ -79,8 +214,23 @@ export class ContentsFileSystemProvider
     private readonly vs: typeof vscode,
     private readonly jupyterConnections: JupyterConnectionManager,
   ) {
+    this.watchConfig = readWatchConfig(
+      vs.workspace.getConfiguration('colab'),
+    );
     this.changeEmitter = new vs.EventEmitter<FileChangeEvent[]>();
     this.onDidChangeFile = this.changeEmitter.event;
+    this.watchRunner = new SequentialTaskRunner(
+      {
+        intervalTimeoutMs: this.watchConfig.pollIntervalMs,
+        taskTimeoutMs: WATCH_TASK_TIMEOUT_MS,
+        abandonGraceMs: 0,
+      },
+      {
+        name: `${ContentsFileSystemProvider.name}.watch`,
+        run: this.pollWatches.bind(this),
+      },
+      OverrunPolicy.AllowToComplete,
+    );
     this.workspaceListener = vs.workspace.onDidChangeWorkspaceFolders(
       this.dropMatchingConnection.bind(this),
     );
@@ -97,6 +247,9 @@ export class ContentsFileSystemProvider
     this.isDisposed = true;
     this.workspaceListener.dispose();
     this.connectionListener.dispose();
+    this.watches.clear();
+    this.watchRunner.dispose();
+    this.changeEmitter.dispose();
   }
 
   /**
@@ -132,31 +285,61 @@ export class ContentsFileSystemProvider
   }
 
   /**
-   * All calls are no-ops.
+   * Polls watched resources for changes.
    *
-   * The Jupyter Server REST API does not support watching and Colab has no
-   * socket-based implementation that can easily be used.
-   *
-   * In the future we may consider adding time-based polling to fire events for
-   * files/directories that have been `watch`-ed.
+   * The Jupyter Server REST API does not support native watching and Colab has
+   * no socket-based implementation that can easily be used. Instead, watched
+   * resources are polled on a fixed interval and translated to file change
+   * events.
    *
    * @param uri - The URI of the resource.
-   * @param _options - Configuration options for the operation.
-   * @returns A no-op disposable.
+   * @param options - Configuration options for the operation.
+   * @returns A disposable that stops polling this watch registration.
    */
   @traceMethod
   watch(
     uri: Uri,
-    _options: {
+    options: {
       readonly recursive: boolean;
       readonly excludes: readonly string[];
     },
   ): Disposable {
     this.guardDisposed();
     this.throwForVsCodeFile(uri);
+    const key = this.buildWatchKey(uri, options.recursive);
+    const existing = this.watches.get(key);
+    if (existing) {
+      existing.refCount += 1;
+    } else {
+      this.watches.set(key, {
+        uri,
+        recursive: options.recursive,
+        refCount: 1,
+        initialized: false,
+        present: false,
+      });
+    }
+
+    if (this.watches.size === 1) {
+      this.watchRunner.start(StartMode.Immediately);
+    } else {
+      this.watchRunner.runNow();
+    }
+
     return {
       dispose: () => {
-        // No-op
+        const watch = this.watches.get(key);
+        if (!watch) {
+          return;
+        }
+        watch.refCount -= 1;
+        if (watch.refCount > 0) {
+          return;
+        }
+        this.watches.delete(key);
+        if (this.watches.size === 0) {
+          this.watchRunner.stop();
+        }
       },
     };
   }
@@ -490,11 +673,13 @@ export class ContentsFileSystemProvider
       if (s.uri.scheme !== 'colab') {
         continue;
       }
+      this.removeWatchesForAuthority(s.uri.authority);
       this.jupyterConnections.drop(s.uri.authority, true);
     }
   }
 
   private removeWorkspaceFolders(endpoints: string[]): void {
+    this.removeWatchesForAuthorities(endpoints);
     const currentFolders = this.vs.workspace.workspaceFolders;
     if (!currentFolders || currentFolders.length === 0) {
       return;
@@ -548,4 +733,451 @@ export class ContentsFileSystemProvider
       throw this.vs.FileSystemError.FileNotFound(uri);
     }
   }
+
+  private async pollWatches(signal: AbortSignal): Promise<void> {
+    if (this.watches.size === 0 || signal.aborted) {
+      return;
+    }
+
+    const events: FileChangeEvent[] = [];
+    const coveredRoots: Uri[] = [];
+    const watches = Array.from(this.watches.values()).sort((a, b) => {
+      return (
+        a.uri.path.length - b.uri.path.length ||
+        Number(b.recursive) - Number(a.recursive)
+      );
+    });
+
+    for (const watch of watches) {
+      if (isAborted(signal)) {
+        break;
+      }
+      if (coveredRoots.some((root) => this.contains(root, watch.uri))) {
+        continue;
+      }
+
+      try {
+        events.push(...(await this.pollWatch(watch, signal)));
+        if (watch.recursive) {
+          coveredRoots.push(watch.uri);
+        }
+      } catch (error: unknown) {
+        if (isAborted(signal)) {
+          break;
+        }
+        log.warn(
+          `Failed to poll watched resource "${watch.uri.toString()}"`,
+          error,
+        );
+      }
+    }
+
+    if (isAborted(signal)) {
+      return;
+    }
+
+    const coalesced = this.coalesceFileEvents(events);
+    if (coalesced.length > 0) {
+      this.changeEmitter.fire(coalesced);
+    }
+  }
+
+  private async pollWatch(
+    watch: WatchState,
+    signal: AbortSignal,
+  ): Promise<FileChangeEvent[]> {
+    const current = await this.readCurrentWatchState(watch, signal);
+    if (isAborted(signal) || current.skipped) {
+      return [];
+    }
+    if (!watch.initialized) {
+      this.updateWatchState(watch, current);
+      return [];
+    }
+
+    const events = this.diffWatchStates(watch, current);
+    if (isAborted(signal)) {
+      return [];
+    }
+    this.updateWatchState(watch, current);
+    return events;
+  }
+
+  private updateWatchState(
+    watch: WatchState,
+    current: Exclude<CurrentWatchState, { readonly skipped: true }>,
+  ): void {
+    watch.initialized = true;
+    watch.present = current.present;
+    if (!current.present) {
+      watch.kind = undefined;
+      watch.snapshot = undefined;
+      return;
+    }
+    watch.kind = current.kind;
+    watch.snapshot = current.snapshot;
+  }
+
+  private diffWatchStates(
+    previous: WatchState,
+    current: Exclude<CurrentWatchState, { readonly skipped: true }>,
+  ): FileChangeEvent[] {
+    if (!previous.present && !current.present) {
+      return [];
+    }
+    if (!previous.present) {
+      return [{ type: this.vs.FileChangeType.Created, uri: previous.uri }];
+    }
+    if (!current.present) {
+      return [{ type: this.vs.FileChangeType.Deleted, uri: previous.uri }];
+    }
+    if (!previous.kind) {
+      return [{ type: this.vs.FileChangeType.Changed, uri: previous.uri }];
+    }
+    if (previous.kind !== current.kind) {
+      return [
+        { type: this.vs.FileChangeType.Deleted, uri: previous.uri },
+        { type: this.vs.FileChangeType.Created, uri: previous.uri },
+      ];
+    }
+    switch (current.kind) {
+      case 'file':
+        if (!previous.snapshot || !isFileSnapshot(previous.snapshot)) {
+          return [{ type: this.vs.FileChangeType.Changed, uri: previous.uri }];
+        }
+        if (
+          previous.snapshot.mtime === current.snapshot.mtime &&
+          previous.snapshot.size === current.snapshot.size
+        ) {
+          return [];
+        }
+        return [{ type: this.vs.FileChangeType.Changed, uri: previous.uri }];
+      case 'directory':
+        if (!previous.snapshot || !isDirectorySnapshot(previous.snapshot)) {
+          return [{ type: this.vs.FileChangeType.Changed, uri: previous.uri }];
+        }
+        return this.diffDirectorySnapshots(previous.snapshot, current.snapshot);
+      default:
+        return assertNever(current);
+    }
+  }
+
+  private diffDirectorySnapshots(
+    previous: DirectorySnapshot,
+    current: DirectorySnapshot,
+  ): FileChangeEvent[] {
+    const deleted: SnapshotEntry[] = [];
+    const created: SnapshotEntry[] = [];
+    const changed: SnapshotEntry[] = [];
+
+    for (const [key, previousEntry] of previous) {
+      const currentEntry = current.get(key);
+      if (!currentEntry) {
+        deleted.push(previousEntry);
+        continue;
+      }
+      if (currentEntry.type !== previousEntry.type) {
+        deleted.push(previousEntry);
+        created.push(currentEntry);
+      } else if (
+        currentEntry.mtime !== previousEntry.mtime ||
+        currentEntry.size !== previousEntry.size
+      ) {
+        changed.push(currentEntry);
+      }
+    }
+
+    for (const [key, currentEntry] of current) {
+      if (!previous.has(key)) {
+        created.push(currentEntry);
+      }
+    }
+
+    return [
+      ...this.collapseNestedEntries(deleted).map((entry) => ({
+        type: this.vs.FileChangeType.Deleted,
+        uri: entry.uri,
+      })),
+      ...this.collapseNestedEntries(created).map((entry) => ({
+        type: this.vs.FileChangeType.Created,
+        uri: entry.uri,
+      })),
+      ...changed.map((entry) => ({
+        type: this.vs.FileChangeType.Changed,
+        uri: entry.uri,
+      })),
+    ];
+  }
+
+  private collapseNestedEntries(
+    entries: readonly SnapshotEntry[],
+  ): SnapshotEntry[] {
+    const collapsed: SnapshotEntry[] = [];
+    const sorted = [...entries].sort(
+      (a, b) => a.uri.path.length - b.uri.path.length,
+    );
+    for (const entry of sorted) {
+      const covered = collapsed.some((candidate) => {
+        return (
+          candidate.type === this.vs.FileType.Directory &&
+          this.contains(candidate.uri, entry.uri)
+        );
+      });
+      if (!covered) {
+        collapsed.push(entry);
+      }
+    }
+    return collapsed;
+  }
+
+  private async readCurrentWatchState(
+    watch: WatchState,
+    signal: AbortSignal,
+  ): Promise<CurrentWatchState> {
+    const client = await this.getExistingClient(watch.uri);
+    if (!client) {
+      return {
+        skipped: true,
+      };
+    }
+    if (isAborted(signal)) {
+      return { skipped: true };
+    }
+    const content = await this.getContentMetadata(
+      client,
+      watch.uri.path,
+      signal,
+    );
+    if (!content) {
+      return {
+        present: false,
+      };
+    }
+
+    const type = toFileType(this.vs, content.type);
+    if (type === this.vs.FileType.Directory) {
+      return {
+        kind: 'directory',
+        present: true,
+        snapshot: await this.collectDirectorySnapshot(
+          client,
+          watch.uri,
+          watch.recursive,
+          signal,
+        ),
+      };
+    }
+
+    return {
+      kind: 'file',
+      present: true,
+      snapshot: {
+        mtime: new Date(content.lastModified).getTime(),
+        size: content.size ?? 0,
+      },
+    };
+  }
+
+  private async getExistingClient(
+    endpoint: string | Uri,
+  ): Promise<ContentsApi | undefined> {
+    endpoint = endpoint instanceof this.vs.Uri ? endpoint.authority : endpoint;
+    try {
+      return await this.jupyterConnections.get(endpoint);
+    } catch (e: unknown) {
+      log.warn(`Unable to get existing Jupyter client for ${endpoint}`, e);
+      return undefined;
+    }
+  }
+
+  private async collectDirectorySnapshot(
+    client: ContentsApi,
+    uri: Uri,
+    recursive: boolean,
+    signal: AbortSignal,
+  ): Promise<DirectorySnapshot> {
+    const snapshot = new Map<string, SnapshotEntry>();
+    const contents = await this.getDirectoryContents(client, uri.path, signal);
+    const pending: PendingDirectorySnapshot[] = [
+      {
+        uri,
+        contents,
+        remainingDepth: MAX_WATCH_DEPTH,
+      },
+    ];
+    const budget: SnapshotCollectionBudget = { entryCount: 0 };
+
+    while (pending.length > 0 && !isAborted(signal)) {
+      const nextRequests: PendingDirectoryRequest[] = [];
+      const currentLevel = pending.splice(0);
+      for (const directory of currentLevel) {
+        if (isAborted(signal)) {
+          break;
+        }
+        this.collectDirectorySnapshotEntries(
+          snapshot,
+          directory,
+          recursive,
+          budget,
+          nextRequests,
+        );
+        if (budget.entryCount >= this.watchConfig.maxSnapshotEntries) {
+          return snapshot;
+        }
+      }
+
+      for (
+        let i = 0;
+        i < nextRequests.length && !isAborted(signal);
+        i += this.watchConfig.snapshotRequestConcurrency
+      ) {
+        const batch = nextRequests.slice(
+          i,
+          i + this.watchConfig.snapshotRequestConcurrency,
+        );
+        const childSnapshots = await Promise.all(
+          batch.map(async (request) => {
+            const nested = await this.getDirectoryContents(
+              client,
+              request.uri.path,
+              signal,
+            );
+            return {
+              uri: request.uri,
+              contents: nested,
+              remainingDepth: request.remainingDepth,
+            };
+          }),
+        );
+        pending.push(...childSnapshots);
+      }
+    }
+    return snapshot;
+  }
+
+  private collectDirectorySnapshotEntries(
+    snapshot: Map<string, SnapshotEntry>,
+    directory: PendingDirectorySnapshot,
+    recursive: boolean,
+    budget: SnapshotCollectionBudget,
+    nextRequests: PendingDirectoryRequest[],
+  ): void {
+    for (const child of directory.contents.content) {
+      if (budget.entryCount >= this.watchConfig.maxSnapshotEntries) {
+        return;
+      }
+      const childUri = this.vs.Uri.joinPath(directory.uri, child.name);
+      const childType = toFileType(this.vs, child.type);
+      snapshot.set(childUri.toString(), {
+        uri: childUri,
+        type: childType,
+        mtime: new Date(child.lastModified).getTime(),
+        size: child.size ?? 0,
+      });
+      budget.entryCount += 1;
+      if (
+        recursive &&
+        directory.remainingDepth > 0 &&
+        childType === this.vs.FileType.Directory
+      ) {
+        nextRequests.push({
+          uri: childUri,
+          remainingDepth: directory.remainingDepth - 1,
+        });
+      }
+    }
+  }
+
+  private async getContentMetadata(
+    client: ContentsApi,
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<Contents | undefined> {
+    try {
+      return await client.get({ path, content: 0 }, { signal });
+    } catch (error: unknown) {
+      if (error instanceof ResponseError && error.response.status === 404) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  private async getDirectoryContents(
+    client: ContentsApi,
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<DirectoryContents> {
+    const contents = await client.get(
+      {
+        path,
+        type: ContentsGetTypeEnum.Directory,
+      },
+      { signal },
+    );
+    if (!isDirectoryContents(contents)) {
+      throw this.vs.FileSystemError.FileNotADirectory(this.vs.Uri.parse(path));
+    }
+    return contents;
+  }
+
+  private buildWatchKey(uri: Uri, recursive: boolean): string {
+    return `${uri.toString()}::${recursive ? 'recursive' : 'direct'}`;
+  }
+
+  private contains(parent: Uri, child: Uri): boolean {
+    if (
+      parent.scheme !== child.scheme ||
+      parent.authority !== child.authority
+    ) {
+      return false;
+    }
+    if (parent.path === child.path) {
+      return true;
+    }
+    const parentPath = parent.path.endsWith('/')
+      ? parent.path
+      : `${parent.path}/`;
+    return child.path.startsWith(parentPath);
+  }
+
+  private coalesceFileEvents(
+    events: readonly FileChangeEvent[],
+  ): FileChangeEvent[] {
+    const coalesced = new Map<string, FileChangeEvent>();
+    for (const event of events) {
+      // Keep the event type in the key so a create/delete pair for a URI
+      // survives coalescing; VS Code consumers need to observe both edges.
+      coalesced.set(`${event.type.toString()}:${event.uri.toString()}`, event);
+    }
+    return Array.from(coalesced.values());
+  }
+
+  private removeWatchesForAuthority(authority: string): void {
+    this.removeWatchesForAuthorities([authority]);
+  }
+
+  private removeWatchesForAuthorities(authorities: readonly string[]): void {
+    if (authorities.length === 0 || this.watches.size === 0) {
+      return;
+    }
+    // Deleting the current Map entry during iteration is spec-safe and avoids a
+    // second pass over watches when a server authority is revoked.
+    for (const [key, watch] of this.watches) {
+      if (authorities.includes(watch.uri.authority)) {
+        this.watches.delete(key);
+      }
+    }
+    if (this.watches.size === 0) {
+      this.watchRunner.stop();
+    }
+  }
 }
+
+export const TEST_ONLY = {
+  WATCH_POLL_INTERVAL_MS,
+  WATCH_TASK_TIMEOUT_MS,
+  MAX_WATCH_DEPTH,
+  WATCH_SNAPSHOT_REQUEST_CONCURRENCY,
+  MAX_WATCH_SNAPSHOT_ENTRIES,
+};
