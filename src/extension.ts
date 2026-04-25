@@ -143,12 +143,14 @@ async function activateInternal(context: vscode.ExtensionContext) {
     assignmentManager,
   );
   const fs = new ContentsFileSystemProvider(vscode, jupyterConnections);
-  const serverContentTreeView = new ContentTreeProvider(
-    assignmentManager,
-    authProvider.onDidChangeSessions,
-    assignmentManager.onDidAssignmentsChange,
-    fs.onDidChangeFile,
-  );
+  const serverContentTreeView = new ContentTreeProvider({
+    assignments: assignmentManager,
+    authChange: authProvider.onDidChangeSessions,
+    assignmentChange: assignmentManager.onDidAssignmentsChange,
+    fileChange: fs.onDidChangeFile,
+    scheme: 'colab',
+    watchResource: fs.watch.bind(fs),
+  });
   const serverResourceTreeView = new ResourceTreeProvider(
     assignmentManager,
     assignmentManager.onDidAssignmentsChange,
