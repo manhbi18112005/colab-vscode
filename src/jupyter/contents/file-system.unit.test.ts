@@ -7,7 +7,12 @@
 import { randomUUID } from 'crypto';
 import { expect } from 'chai';
 import sinon from 'sinon';
-import { FileChangeEvent, Uri, WorkspaceFoldersChangeEvent } from 'vscode';
+import {
+  FileChangeEvent,
+  Uri,
+  WorkspaceConfiguration,
+  WorkspaceFoldersChangeEvent,
+} from 'vscode';
 import { Variant } from '../../colab/api';
 import { TestEventEmitter } from '../../test/helpers/events';
 import { TestUri } from '../../test/helpers/uri';
@@ -25,7 +30,7 @@ import {
   ResponseError,
 } from '../client/generated';
 import { ColabAssignedServer } from '../servers';
-import { ContentsFileSystemProvider } from './file-system';
+import { ContentsFileSystemProvider, TEST_ONLY } from './file-system';
 import { JupyterConnectionManager } from './sessions';
 
 const DEFAULT_SERVER: ColabAssignedServer = {
@@ -54,6 +59,12 @@ const FOO_CONTENT_DIR: Contents = {
   mimetype: '',
   content: '',
   format: '',
+};
+
+const ROOT_CONTENT_DIR: Contents = {
+  ...FOO_CONTENT_DIR,
+  name: 'content',
+  path: '/',
 };
 
 const FOO_CONTENT_FILE: Contents = {
@@ -85,6 +96,7 @@ const FORBIDDEN = new ResponseError(new Response(undefined, { status: 403 }));
 const NOT_FOUND = new ResponseError(new Response(undefined, { status: 404 }));
 const CONFLICT = new ResponseError(new Response(undefined, { status: 409 }));
 const TEAPOT = new ResponseError(new Response(undefined, { status: 418 }));
+const WATCH_POLL_INTERVAL_MS = TEST_ONLY.WATCH_POLL_INTERVAL_MS;
 
 describe('ContentsFileSystemProvider', () => {
   let vs: VsCodeStub;
@@ -98,6 +110,7 @@ describe('ContentsFileSystemProvider', () => {
     endpoint: string,
   ): sinon.SinonStubbedInstance<ContentsApi> {
     const contentsStub = sinon.createStubInstance(ContentsApi);
+    jupyterStub.get.withArgs(endpoint).resolves(contentsStub);
     jupyterStub.getOrCreate.withArgs(endpoint).resolves(contentsStub);
     return contentsStub;
   }
@@ -328,6 +341,97 @@ describe('ContentsFileSystemProvider', () => {
   });
 
   describe('watch', () => {
+    let fakeClock: sinon.SinonFakeTimers;
+
+    async function flushWatchRun() {
+      await fakeClock.tickAsync(0);
+    }
+
+    function recreateFsWithWatchConfig(options: {
+      readonly pollIntervalMs?: number;
+      readonly snapshotRequestConcurrency?: number;
+      readonly maxSnapshotEntries?: number;
+    }): void {
+      fs.dispose();
+      const get = ((section: string, defaultValue?: unknown) => {
+        if (typeof defaultValue !== 'number') {
+          return defaultValue;
+        }
+        let value: number;
+        switch (section) {
+          case 'fileWatchPollIntervalMs':
+            value = options.pollIntervalMs ?? defaultValue;
+            break;
+          case 'fileWatchSnapshotRequestConcurrency':
+            value = options.snapshotRequestConcurrency ?? defaultValue;
+            break;
+          case 'fileWatchMaxSnapshotEntries':
+            value = options.maxSnapshotEntries ?? defaultValue;
+            break;
+          default:
+            value = defaultValue;
+        }
+        return value;
+      }) as WorkspaceConfiguration['get'];
+      vs.workspace.getConfiguration.withArgs('colab').returns({
+        get,
+      } as Pick<WorkspaceConfiguration, 'get'> as WorkspaceConfiguration);
+      fs = new ContentsFileSystemProvider(vs.asVsCode(), jupyterStub);
+      listener = sinon.stub();
+      fs.onDidChangeFile(listener);
+    }
+
+    function stubWatchedRootDirectory(): {
+      contentsStub: sinon.SinonStubbedInstance<ContentsApi>;
+      rootContents: DirectoryContents;
+      fooContents: DirectoryContents;
+    } {
+      const contentsStub = stubClient('m-s-foo');
+      const rootContents: DirectoryContents = {
+        ...ROOT_CONTENT_DIR,
+        type: 'directory',
+        content: [],
+      };
+      const fooContents: DirectoryContents = {
+        ...FOO_CONTENT_DIR,
+        type: 'directory',
+        content: [],
+      };
+      contentsStub.get.callsFake((request) => {
+        if (request.path === '/' && request.content === 0) {
+          return Promise.resolve(ROOT_CONTENT_DIR);
+        }
+        if (
+          request.path === '/' &&
+          request.type === ContentsGetTypeEnum.Directory
+        ) {
+          return Promise.resolve(rootContents);
+        }
+        if (
+          request.path === '/foo' &&
+          request.type === ContentsGetTypeEnum.Directory
+        ) {
+          return Promise.resolve(fooContents);
+        }
+        return Promise.reject(
+          new Error(
+            `Unexpected contents.get request: ${JSON.stringify(request)}`,
+          ),
+        );
+      });
+      return { contentsStub, rootContents, fooContents };
+    }
+
+    beforeEach(() => {
+      fakeClock = sinon.useFakeTimers({
+        toFake: ['setInterval', 'clearInterval', 'setTimeout'],
+      });
+    });
+
+    afterEach(() => {
+      fakeClock.restore();
+    });
+
     it('throws when disposed', () => {
       fs.dispose();
 
@@ -348,13 +452,1049 @@ describe('ContentsFileSystemProvider', () => {
       }).to.throw(/FileNotFound/);
     });
 
-    it('no-ops', () => {
-      expect(
+    it('returns a disposable and does not emit during the initial snapshot', async () => {
+      stubWatchedRootDirectory();
+
+      const watch = fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: false,
+        excludes: [],
+      });
+
+      expect(watch).to.have.property('dispose');
+      await flushWatchRun();
+
+      sinon.assert.notCalled(listener);
+    });
+
+    it('uses the configured watch poll interval', async () => {
+      recreateFsWithWatchConfig({ pollIntervalMs: 25 });
+      const { rootContents } = stubWatchedRootDirectory();
+
+      fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: false,
+        excludes: [],
+      });
+      await flushWatchRun();
+      listener.resetHistory();
+
+      rootContents.content = [FOO_CONTENT_FILE];
+      await fakeClock.tickAsync(24);
+      sinon.assert.notCalled(listener);
+
+      await fakeClock.tickAsync(1);
+      sinon.assert.calledOnceWithMatch(listener, [
+        {
+          type: FileChangeType.Created,
+          uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+        },
+      ]);
+    });
+
+    it('passes the poll abort signal to Jupyter contents requests', async () => {
+      const { contentsStub } = stubWatchedRootDirectory();
+
+      fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: false,
+        excludes: [],
+      });
+      await flushWatchRun();
+
+      for (const call of contentsStub.get.getCalls()) {
+        expect(call.args[1])
+          .to.have.property('signal')
+          .that.is.instanceOf(AbortSignal);
+      }
+    });
+
+    it('stops recursive snapshot collection at the configured entry cap', async () => {
+      recreateFsWithWatchConfig({ maxSnapshotEntries: 1 });
+      const { contentsStub, rootContents } = stubWatchedRootDirectory();
+      rootContents.content = [FOO_CONTENT_DIR];
+
+      fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: true,
+        excludes: [],
+      });
+      await flushWatchRun();
+
+      sinon.assert.neverCalledWithMatch(contentsStub.get, {
+        path: '/foo',
+        type: ContentsGetTypeEnum.Directory,
+      });
+    });
+
+    it('limits recursive snapshot directory requests', async () => {
+      recreateFsWithWatchConfig({ snapshotRequestConcurrency: 2 });
+      const contentsStub = stubClient('m-s-foo');
+      const childDirectories: Contents[] = ['a', 'b', 'c'].map((name) => ({
+        ...FOO_CONTENT_DIR,
+        name,
+        path: `/${name}`,
+      }));
+      const rootContents: DirectoryContents = {
+        ...ROOT_CONTENT_DIR,
+        type: 'directory',
+        content: childDirectories,
+      };
+      let inFlight = 0;
+      let maxInFlight = 0;
+      contentsStub.get.callsFake(async (request) => {
+        if (request.path === '/' && request.content === 0) {
+          return ROOT_CONTENT_DIR;
+        }
+        if (
+          request.path === '/' &&
+          request.type === ContentsGetTypeEnum.Directory
+        ) {
+          return rootContents;
+        }
+        if (
+          childDirectories.some((entry) => entry.path === request.path) &&
+          request.type === ContentsGetTypeEnum.Directory
+        ) {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await Promise.resolve();
+          inFlight -= 1;
+          return {
+            ...FOO_CONTENT_DIR,
+            name: request.path.slice(1),
+            path: request.path,
+            type: 'directory',
+            content: [],
+          };
+        }
+        return Promise.reject(
+          new Error(
+            `Unexpected contents.get request: ${JSON.stringify(request)}`,
+          ),
+        );
+      });
+
+      fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: true,
+        excludes: [],
+      });
+      await flushWatchRun();
+
+      expect(maxInFlight).to.equal(2);
+    });
+
+    it('does not create a Jupyter client while polling watches', async () => {
+      fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: false,
+        excludes: [],
+      });
+
+      await flushWatchRun();
+
+      sinon.assert.calledWith(jupyterStub.get, 'm-s-foo');
+      sinon.assert.notCalled(jupyterStub.getOrCreate);
+      sinon.assert.notCalled(listener);
+    });
+
+    it('uses the first existing client poll as the initial snapshot', async () => {
+      fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: false,
+        excludes: [],
+      });
+      await flushWatchRun();
+
+      const { rootContents } = stubWatchedRootDirectory();
+      rootContents.content = [FOO_CONTENT_FILE];
+      await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+      sinon.assert.notCalled(listener);
+    });
+
+    it('does not emit when a watched directory is unchanged', async () => {
+      const { rootContents } = stubWatchedRootDirectory();
+      rootContents.content = [FOO_CONTENT_FILE];
+
+      fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: false,
+        excludes: [],
+      });
+      await flushWatchRun();
+      listener.resetHistory();
+
+      await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+      sinon.assert.notCalled(listener);
+    });
+
+    it('emits created and deleted events for direct child changes', async () => {
+      const { rootContents } = stubWatchedRootDirectory();
+
+      fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: false,
+        excludes: [],
+      });
+      await flushWatchRun();
+      listener.resetHistory();
+
+      rootContents.content = [FOO_CONTENT_FILE];
+      await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+      sinon.assert.calledOnceWithMatch(listener, [
+        {
+          type: FileChangeType.Created,
+          uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+        },
+      ]);
+
+      listener.resetHistory();
+      rootContents.content = [];
+      await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+      sinon.assert.calledOnceWithMatch(listener, [
+        {
+          type: FileChangeType.Deleted,
+          uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+        },
+      ]);
+    });
+
+    it('emits recursive events for nested directory changes', async () => {
+      const { rootContents, fooContents } = stubWatchedRootDirectory();
+      rootContents.content = [FOO_CONTENT_DIR];
+      const nestedFile: Contents = {
+        ...FOO_CONTENT_FILE,
+        path: '/foo/foo.txt',
+      };
+
+      fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: true,
+        excludes: [],
+      });
+      await flushWatchRun();
+      listener.resetHistory();
+
+      fooContents.content = [nestedFile];
+      await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+      sinon.assert.calledOnceWithMatch(listener, [
+        {
+          type: FileChangeType.Created,
+          uri: uriStringMatch('colab://m-s-foo/foo/foo.txt'),
+        },
+      ]);
+    });
+
+    it('stops polling when the returned disposable is disposed', async () => {
+      const { contentsStub } = stubWatchedRootDirectory();
+      const watch = fs.watch(TestUri.parse('colab://m-s-foo/'), {
+        recursive: false,
+        excludes: [],
+      });
+      await flushWatchRun();
+      contentsStub.get.resetHistory();
+
+      watch.dispose();
+      await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+      sinon.assert.notCalled(contentsStub.get);
+    });
+
+    describe('file watch', () => {
+      function stubWatchedFile(
+        endpoint: string,
+        path: string,
+        initial: Contents,
+      ): {
+        contentsStub: sinon.SinonStubbedInstance<ContentsApi>;
+        metadata: Contents;
+      } {
+        const contentsStub = stubClient(endpoint);
+        const metadata = { ...initial };
+        contentsStub.get.callsFake((request) => {
+          if (request.path === path && request.content === 0) {
+            return Promise.resolve({ ...metadata });
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+        return { contentsStub, metadata };
+      }
+
+      it('emits changed when mtime advances', async () => {
+        const { metadata } = stubWatchedFile(
+          'm-s-foo',
+          '/foo.txt',
+          FOO_CONTENT_FILE,
+        );
+
+        fs.watch(TestUri.parse('colab://m-s-foo/foo.txt'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        metadata.lastModified = '2026-01-01T00:00:00Z';
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Changed,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+          },
+        ]);
+      });
+
+      it('emits a single changed event when both mtime and size change', async () => {
+        const { metadata } = stubWatchedFile(
+          'm-s-foo',
+          '/foo.txt',
+          FOO_CONTENT_FILE,
+        );
+
+        fs.watch(TestUri.parse('colab://m-s-foo/foo.txt'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        metadata.lastModified = '2026-01-01T00:00:00Z';
+        metadata.size = 99;
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnce(listener);
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Changed,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+          },
+        ]);
+      });
+
+      it('emits changed when size changes', async () => {
+        const { metadata } = stubWatchedFile(
+          'm-s-foo',
+          '/foo.txt',
+          FOO_CONTENT_FILE,
+        );
+
+        fs.watch(TestUri.parse('colab://m-s-foo/foo.txt'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        metadata.size = 42;
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Changed,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+          },
+        ]);
+      });
+
+      it('does not emit when file metadata is unchanged', async () => {
+        stubWatchedFile('m-s-foo', '/foo.txt', FOO_CONTENT_FILE);
+
+        fs.watch(TestUri.parse('colab://m-s-foo/foo.txt'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.notCalled(listener);
+      });
+    });
+
+    describe('resource presence transitions', () => {
+      it('emits deleted when a watched file disappears', async () => {
+        const contentsStub = stubClient('m-s-foo');
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/foo.txt' && request.content === 0) {
+            return Promise.resolve(FOO_CONTENT_FILE);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+
+        fs.watch(TestUri.parse('colab://m-s-foo/foo.txt'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/foo.txt' && request.content === 0) {
+            return Promise.reject(NOT_FOUND);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Deleted,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+          },
+        ]);
+      });
+
+      it('emits created when a previously absent resource appears', async () => {
+        const contentsStub = stubClient('m-s-foo');
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/foo.txt' && request.content === 0) {
+            return Promise.reject(NOT_FOUND);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+
+        fs.watch(TestUri.parse('colab://m-s-foo/foo.txt'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/foo.txt' && request.content === 0) {
+            return Promise.resolve(FOO_CONTENT_FILE);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Created,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+          },
+        ]);
+      });
+
+      it('does not emit when a resource remains absent', async () => {
+        const contentsStub = stubClient('m-s-foo');
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/foo.txt' && request.content === 0) {
+            return Promise.reject(NOT_FOUND);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+
+        fs.watch(TestUri.parse('colab://m-s-foo/foo.txt'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.notCalled(listener);
+      });
+    });
+
+    describe('kind transitions', () => {
+      it('emits delete and create when a file becomes a directory', async () => {
+        const contentsStub = stubClient('m-s-foo');
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/foo' && request.content === 0) {
+            return Promise.resolve(FOO_CONTENT_FILE);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+
+        fs.watch(TestUri.parse('colab://m-s-foo/foo'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        const fooAsDir: DirectoryContents = {
+          ...FOO_CONTENT_DIR,
+          type: 'directory',
+          content: [],
+        };
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/foo' && request.content === 0) {
+            return Promise.resolve(FOO_CONTENT_DIR);
+          }
+          if (
+            request.path === '/foo' &&
+            request.type === ContentsGetTypeEnum.Directory
+          ) {
+            return Promise.resolve(fooAsDir);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Deleted,
+            uri: uriStringMatch('colab://m-s-foo/foo'),
+          },
+          {
+            type: FileChangeType.Created,
+            uri: uriStringMatch('colab://m-s-foo/foo'),
+          },
+        ]);
+      });
+
+      it('emits delete and create when a directory becomes a file', async () => {
+        const contentsStub = stubClient('m-s-foo');
+        const fooAsDir: DirectoryContents = {
+          ...FOO_CONTENT_DIR,
+          type: 'directory',
+          content: [],
+        };
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/foo' && request.content === 0) {
+            return Promise.resolve(FOO_CONTENT_DIR);
+          }
+          if (
+            request.path === '/foo' &&
+            request.type === ContentsGetTypeEnum.Directory
+          ) {
+            return Promise.resolve(fooAsDir);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+
+        fs.watch(TestUri.parse('colab://m-s-foo/foo'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/foo' && request.content === 0) {
+            return Promise.resolve({
+              ...FOO_CONTENT_FILE,
+              name: 'foo',
+              path: '/foo',
+            });
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Deleted,
+            uri: uriStringMatch('colab://m-s-foo/foo'),
+          },
+          {
+            type: FileChangeType.Created,
+            uri: uriStringMatch('colab://m-s-foo/foo'),
+          },
+        ]);
+      });
+    });
+
+    describe('reference counting', () => {
+      it('continues polling when one of multiple watchers disposes', async () => {
+        const { contentsStub } = stubWatchedRootDirectory();
+        const watch1 = fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        // Second watch increments refCount; we don't need the disposable.
         fs.watch(TestUri.parse('colab://m-s-foo/'), {
           recursive: false,
           excludes: [],
-        }),
-      ).to.have.property('dispose');
+        });
+        await flushWatchRun();
+        contentsStub.get.resetHistory();
+
+        watch1.dispose();
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.called(contentsStub.get);
+      });
+
+      it('stops polling only when all watchers for a URI dispose', async () => {
+        const { contentsStub } = stubWatchedRootDirectory();
+        const watch1 = fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        const watch2 = fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        contentsStub.get.resetHistory();
+
+        watch1.dispose();
+        watch2.dispose();
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.notCalled(contentsStub.get);
+      });
+
+      it('treats recursive and non-recursive watches as separate registrations', async () => {
+        const { contentsStub } = stubWatchedRootDirectory();
+        const watchDirect = fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        const watchRecursive = fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: true,
+          excludes: [],
+        });
+        await flushWatchRun();
+        contentsStub.get.resetHistory();
+
+        watchDirect.dispose();
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        // The recursive watch is still active, so polling continues.
+        sinon.assert.called(contentsStub.get);
+
+        contentsStub.get.resetHistory();
+        watchRecursive.dispose();
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.notCalled(contentsStub.get);
+      });
+
+      it('resumes polling when a new watch is registered after all prior watchers disposed', async () => {
+        const { contentsStub, rootContents } = stubWatchedRootDirectory();
+        const watch1 = fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+
+        watch1.dispose();
+        contentsStub.get.resetHistory();
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+        // Polling should have stopped.
+        sinon.assert.notCalled(contentsStub.get);
+
+        // Re-register a fresh watch on the same URI.
+        fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        rootContents.content = [FOO_CONTENT_FILE];
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Created,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+          },
+        ]);
+      });
+
+      it('no-ops when disposing an already-removed watch', async () => {
+        stubWatchedRootDirectory();
+        const watch = fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+
+        watch.dispose();
+        // Second dispose should not throw.
+
+        expect(() => {
+          watch.dispose();
+        }).to.not.throw();
+      });
+    });
+
+    describe('covered roots deduplication', () => {
+      it('skips a non-recursive child watch already covered by a recursive parent', async () => {
+        const contentsStub = stubClient('m-s-foo');
+        const rootContents: DirectoryContents = {
+          ...ROOT_CONTENT_DIR,
+          type: 'directory',
+          content: [FOO_CONTENT_DIR],
+        };
+        const fooContents: DirectoryContents = {
+          ...FOO_CONTENT_DIR,
+          type: 'directory',
+          content: [],
+        };
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/' && request.content === 0) {
+            return Promise.resolve(ROOT_CONTENT_DIR);
+          }
+          if (
+            request.path === '/' &&
+            request.type === ContentsGetTypeEnum.Directory
+          ) {
+            return Promise.resolve(rootContents);
+          }
+          if (request.path === '/foo' && request.content === 0) {
+            return Promise.resolve(FOO_CONTENT_DIR);
+          }
+          if (
+            request.path === '/foo' &&
+            request.type === ContentsGetTypeEnum.Directory
+          ) {
+            return Promise.resolve(fooContents);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+
+        // Register recursive parent first, then non-recursive child.
+        fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: true,
+          excludes: [],
+        });
+        fs.watch(TestUri.parse('colab://m-s-foo/foo'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        // Add a file in /foo. Only the recursive parent should detect and
+        // report it — the child watch should be skipped as covered.
+        const nestedFile: Contents = {
+          ...FOO_CONTENT_FILE,
+          path: '/foo/bar.txt',
+          name: 'bar.txt',
+        };
+        fooContents.content = [nestedFile];
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        // Exactly one event batch (not duplicated from the child watch).
+        sinon.assert.calledOnce(listener);
+      });
+    });
+
+    describe('error isolation', () => {
+      it('continues polling other watches when one watch errors', async () => {
+        const contentsStub = stubClient('m-s-foo');
+        const rootContents: DirectoryContents = {
+          ...ROOT_CONTENT_DIR,
+          type: 'directory',
+          content: [],
+        };
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/' && request.content === 0) {
+            return Promise.resolve(ROOT_CONTENT_DIR);
+          }
+          if (
+            request.path === '/' &&
+            request.type === ContentsGetTypeEnum.Directory
+          ) {
+            return Promise.resolve(rootContents);
+          }
+          if (request.path === '/broken' && request.content === 0) {
+            return Promise.reject(new Error('network failure'));
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+
+        // The broken watch will fail on every poll but should not prevent
+        // the root watch from detecting changes.
+        fs.watch(TestUri.parse('colab://m-s-foo/broken'), {
+          recursive: false,
+          excludes: [],
+        });
+        fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        // Flush the initial poll and a second interval to ensure both
+        // watches have been initialized (the first start+runNow may only
+        // yield one poll cycle due to AllowToComplete).
+        await flushWatchRun();
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+        listener.resetHistory();
+
+        rootContents.content = [FOO_CONTENT_FILE];
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Created,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+          },
+        ]);
+      });
+
+      it('does not let a failing recursive parent suppress child watches', async () => {
+        const contentsStub = stubClient('m-s-foo');
+        const fooContents: DirectoryContents = {
+          ...FOO_CONTENT_DIR,
+          type: 'directory',
+          content: [],
+        };
+        contentsStub.get.callsFake((request) => {
+          if (request.path === '/' && request.content === 0) {
+            return Promise.resolve(ROOT_CONTENT_DIR);
+          }
+          if (
+            request.path === '/' &&
+            request.type === ContentsGetTypeEnum.Directory
+          ) {
+            return Promise.reject(new Error('root snapshot failed'));
+          }
+          if (request.path === '/foo' && request.content === 0) {
+            return Promise.resolve(FOO_CONTENT_DIR);
+          }
+          if (
+            request.path === '/foo' &&
+            request.type === ContentsGetTypeEnum.Directory
+          ) {
+            return Promise.resolve(fooContents);
+          }
+          return Promise.reject(
+            new Error(
+              `Unexpected contents.get request: ${JSON.stringify(request)}`,
+            ),
+          );
+        });
+
+        fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: true,
+          excludes: [],
+        });
+        fs.watch(TestUri.parse('colab://m-s-foo/foo'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+        listener.resetHistory();
+
+        fooContents.content = [
+          {
+            ...FOO_CONTENT_FILE,
+            name: 'bar.txt',
+            path: '/foo/bar.txt',
+          },
+        ];
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Created,
+            uri: uriStringMatch('colab://m-s-foo/foo/bar.txt'),
+          },
+        ]);
+      });
+    });
+
+    describe('directory child metadata change', () => {
+      it('emits changed when a child file mtime advances within a watched directory', async () => {
+        const { rootContents } = stubWatchedRootDirectory();
+        rootContents.content = [FOO_CONTENT_FILE];
+
+        fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        rootContents.content = [
+          { ...FOO_CONTENT_FILE, lastModified: '2026-01-01T00:00:00Z' },
+        ];
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Changed,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+          },
+        ]);
+      });
+
+      it('emits changed when a child file size changes within a watched directory', async () => {
+        const { rootContents } = stubWatchedRootDirectory();
+        rootContents.content = [FOO_CONTENT_FILE];
+
+        fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        rootContents.content = [{ ...FOO_CONTENT_FILE, size: 1024 }];
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Changed,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+          },
+        ]);
+      });
+
+      it('does not emit when a child file metadata is unchanged', async () => {
+        const { rootContents } = stubWatchedRootDirectory();
+        rootContents.content = [FOO_CONTENT_FILE];
+
+        fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.notCalled(listener);
+      });
+
+      it('emits changed for a nested file modification in a recursive watch', async () => {
+        const { rootContents, fooContents } = stubWatchedRootDirectory();
+        rootContents.content = [FOO_CONTENT_DIR];
+        const nestedFile: Contents = {
+          ...FOO_CONTENT_FILE,
+          path: '/foo/foo.txt',
+        };
+        fooContents.content = [nestedFile];
+
+        fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: true,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        fooContents.content = [
+          { ...nestedFile, lastModified: '2026-06-01T00:00:00Z', size: 999 },
+        ];
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Changed,
+            uri: uriStringMatch('colab://m-s-foo/foo/foo.txt'),
+          },
+        ]);
+      });
+    });
+
+    describe('directory child type change', () => {
+      it('emits delete and create when a child changes from file to directory', async () => {
+        const { rootContents } = stubWatchedRootDirectory();
+        rootContents.content = [FOO_CONTENT_FILE];
+
+        fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: false,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        // Replace the file entry with a directory of the same name.
+        rootContents.content = [
+          { ...FOO_CONTENT_FILE, type: 'directory' } as Contents,
+        ];
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        sinon.assert.calledOnceWithMatch(listener, [
+          {
+            type: FileChangeType.Deleted,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+          },
+          {
+            type: FileChangeType.Created,
+            uri: uriStringMatch('colab://m-s-foo/foo.txt'),
+          },
+        ]);
+      });
+    });
+
+    describe('collapse nested entries', () => {
+      it('collapses child events under a deleted parent directory', async () => {
+        const { rootContents, fooContents } = stubWatchedRootDirectory();
+        const nestedFile: Contents = {
+          ...FOO_CONTENT_FILE,
+          path: '/foo/bar.txt',
+          name: 'bar.txt',
+        };
+        rootContents.content = [FOO_CONTENT_DIR];
+        fooContents.content = [nestedFile];
+
+        fs.watch(TestUri.parse('colab://m-s-foo/'), {
+          recursive: true,
+          excludes: [],
+        });
+        await flushWatchRun();
+        listener.resetHistory();
+
+        // Remove the entire /foo directory (including its child).
+        rootContents.content = [];
+        fooContents.content = [];
+        await fakeClock.tickAsync(WATCH_POLL_INTERVAL_MS);
+
+        // Should emit a single Deleted event for /foo, not separate events
+        // for both /foo and /foo/bar.txt.
+        sinon.assert.calledOnce(listener);
+        const events: FileChangeEvent[] = listener.firstCall.args[0];
+        const deletedUris = events
+          .filter((e) => e.type === vs.FileChangeType.Deleted)
+          .map((e) => e.uri.toString());
+        expect(deletedUris).to.include('colab://m-s-foo/foo');
+        expect(deletedUris).to.not.include('colab://m-s-foo/foo/bar.txt');
+      });
     });
   });
 
