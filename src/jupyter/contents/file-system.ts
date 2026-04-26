@@ -66,7 +66,10 @@ interface SnapshotEntry {
   readonly size: number;
 }
 
-type DirectorySnapshot = ReadonlyMap<string, SnapshotEntry>;
+interface DirectorySnapshot {
+  readonly entries: ReadonlyMap<string, SnapshotEntry>;
+  readonly complete: boolean;
+}
 type WatchKind = 'directory' | 'file';
 type WatchSnapshot = DirectorySnapshot | FileSnapshot;
 
@@ -77,7 +80,7 @@ function isFileSnapshot(snapshot: WatchSnapshot): snapshot is FileSnapshot {
 function isDirectorySnapshot(
   snapshot: WatchSnapshot,
 ): snapshot is DirectorySnapshot {
-  return snapshot instanceof Map;
+  return 'complete' in snapshot;
 }
 
 type CurrentWatchState =
@@ -324,8 +327,13 @@ export class ContentsFileSystemProvider
       this.watchRunner.runNow();
     }
 
+    let disposed = false;
     return {
       dispose: () => {
+        if (disposed) {
+          return;
+        }
+        disposed = true;
         const watch = this.watches.get(key);
         if (!watch) {
           return;
@@ -737,22 +745,25 @@ export class ContentsFileSystemProvider
       return;
     }
 
-    const events: FileChangeEvent[] = [];
-    const coveredRoots: Uri[] = [];
-    const watches = Array.from(this.watches.values()).sort((a, b) => {
-      return (
-        a.uri.path.length - b.uri.path.length ||
-        Number(b.recursive) - Number(a.recursive)
-      );
-    });
+    const eventGroups: { watch: WatchState; events: FileChangeEvent[] }[] = [];
+    const processed = new Set<WatchState>();
 
-    for (const watch of watches) {
+    for (;;) {
       if (isAborted(signal)) {
         break;
       }
-      if (coveredRoots.some((root) => this.contains(root, watch.uri))) {
-        continue;
+      const remaining = Array.from(this.watches.values())
+        .filter((candidate) => !processed.has(candidate))
+        .sort(
+          (a, b) =>
+            a.uri.path.length - b.uri.path.length ||
+            Number(b.recursive) - Number(a.recursive),
+        );
+      const watch = remaining.shift();
+      if (watch === undefined) {
+        break;
       }
+      processed.add(watch);
       if (!this.isWatchRegistered(watch)) {
         continue;
       }
@@ -762,10 +773,7 @@ export class ContentsFileSystemProvider
         if (!this.isWatchRegistered(watch)) {
           continue;
         }
-        events.push(...watchEvents);
-        if (watch.recursive) {
-          coveredRoots.push(watch.uri);
-        }
+        eventGroups.push({ watch, events: watchEvents });
       } catch (error: unknown) {
         if (isAborted(signal)) {
           break;
@@ -781,6 +789,9 @@ export class ContentsFileSystemProvider
       return;
     }
 
+    const events = eventGroups.flatMap((group) =>
+      this.isWatchRegistered(group.watch) ? group.events : [],
+    );
     const coalesced = this.coalesceFileEvents(events);
     if (coalesced.length > 0) {
       this.changeEmitter.fire(coalesced);
@@ -863,24 +874,34 @@ export class ContentsFileSystemProvider
         return [{ type: this.vs.FileChangeType.Changed, uri: previous.uri }];
       case 'directory':
         if (!previous.snapshot || !isDirectorySnapshot(previous.snapshot)) {
-          return [{ type: this.vs.FileChangeType.Changed, uri: previous.uri }];
+          return this.conservativeDirectoryChange(previous.uri);
         }
-        return this.diffDirectorySnapshots(previous.snapshot, current.snapshot);
+        return this.diffDirectorySnapshots(
+          previous.uri,
+          previous.snapshot,
+          current.snapshot,
+        );
       default:
         return assertNever(current);
     }
   }
 
   private diffDirectorySnapshots(
+    uri: Uri,
     previous: DirectorySnapshot,
     current: DirectorySnapshot,
   ): FileChangeEvent[] {
+    if (!previous.complete || !current.complete) {
+      return this.directorySnapshotChanged(previous, current)
+        ? this.conservativeDirectoryChange(uri)
+        : [];
+    }
     const deleted: SnapshotEntry[] = [];
     const created: SnapshotEntry[] = [];
     const changed: SnapshotEntry[] = [];
 
-    for (const [key, previousEntry] of previous) {
-      const currentEntry = current.get(key);
+    for (const [key, previousEntry] of previous.entries) {
+      const currentEntry = current.entries.get(key);
       if (!currentEntry) {
         deleted.push(previousEntry);
         continue;
@@ -896,8 +917,8 @@ export class ContentsFileSystemProvider
       }
     }
 
-    for (const [key, currentEntry] of current) {
-      if (!previous.has(key)) {
+    for (const [key, currentEntry] of current.entries) {
+      if (!previous.entries.has(key)) {
         created.push(currentEntry);
       }
     }
@@ -916,6 +937,36 @@ export class ContentsFileSystemProvider
         uri: entry.uri,
       })),
     ];
+  }
+
+  private conservativeDirectoryChange(uri: Uri): FileChangeEvent[] {
+    return [{ type: this.vs.FileChangeType.Changed, uri }];
+  }
+
+  private directorySnapshotChanged(
+    previous: DirectorySnapshot,
+    current: DirectorySnapshot,
+  ): boolean {
+    if (previous.complete !== current.complete) {
+      return true;
+    }
+    if (previous.entries.size !== current.entries.size) {
+      return true;
+    }
+    for (const [key, previousEntry] of previous.entries) {
+      const currentEntry = current.entries.get(key);
+      if (!currentEntry) {
+        return true;
+      }
+      if (
+        currentEntry.type !== previousEntry.type ||
+        currentEntry.mtime !== previousEntry.mtime ||
+        currentEntry.size !== previousEntry.size
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private collapseNestedEntries(
@@ -968,12 +1019,7 @@ export class ContentsFileSystemProvider
       return {
         kind: 'directory',
         present: true,
-        snapshot: await this.collectDirectorySnapshot(
-          client,
-          watch.uri,
-          watch.recursive,
-          signal,
-        ),
+        snapshot: await this.collectDirectorySnapshot(client, watch, signal),
       };
     }
 
@@ -1001,20 +1047,24 @@ export class ContentsFileSystemProvider
 
   private async collectDirectorySnapshot(
     client: ContentsApi,
-    uri: Uri,
-    recursive: boolean,
+    watch: WatchState,
     signal: AbortSignal,
   ): Promise<DirectorySnapshot> {
     const snapshot = new Map<string, SnapshotEntry>();
-    const contents = await this.getDirectoryContents(client, uri.path, signal);
+    const contents = await this.getDirectoryContents(
+      client,
+      watch.uri.path,
+      signal,
+    );
     const pending: PendingDirectorySnapshot[] = [
       {
-        uri,
+        uri: watch.uri,
         contents,
         remainingDepth: MAX_WATCH_DEPTH,
       },
     ];
     const budget: SnapshotCollectionBudget = { entryCount: 0 };
+    let complete = true;
 
     while (pending.length > 0 && !isAborted(signal)) {
       const nextRequests: PendingDirectoryRequest[] = [];
@@ -1023,16 +1073,26 @@ export class ContentsFileSystemProvider
         if (isAborted(signal)) {
           break;
         }
-        this.collectDirectorySnapshotEntries(
+        const directoryComplete = this.collectDirectorySnapshotEntries(
           snapshot,
           directory,
-          recursive,
+          watch,
           budget,
           nextRequests,
         );
-        if (budget.entryCount >= this.watchConfig.maxSnapshotEntries) {
-          return snapshot;
+        complete = directoryComplete && complete;
+        if (
+          !directoryComplete &&
+          budget.entryCount >= this.watchConfig.maxSnapshotEntries
+        ) {
+          return { entries: snapshot, complete };
         }
+      }
+      if (
+        budget.entryCount >= this.watchConfig.maxSnapshotEntries &&
+        nextRequests.length > 0
+      ) {
+        return { entries: snapshot, complete: false };
       }
 
       for (
@@ -1046,11 +1106,15 @@ export class ContentsFileSystemProvider
         );
         const childSnapshots = await Promise.all(
           batch.map(async (request) => {
-            const nested = await this.getDirectoryContents(
+            const nested = await this.getOptionalDirectoryContents(
               client,
               request.uri.path,
               signal,
             );
+            if (!nested) {
+              complete = false;
+              return undefined;
+            }
             return {
               uri: request.uri,
               contents: nested,
@@ -1058,25 +1122,36 @@ export class ContentsFileSystemProvider
             };
           }),
         );
-        pending.push(...childSnapshots);
+        pending.push(
+          ...childSnapshots.filter(
+            (snapshot): snapshot is PendingDirectorySnapshot =>
+              Boolean(snapshot),
+          ),
+        );
       }
     }
-    return snapshot;
+    if (pending.length > 0) {
+      complete = false;
+    }
+    return { entries: snapshot, complete };
   }
 
   private collectDirectorySnapshotEntries(
     snapshot: Map<string, SnapshotEntry>,
     directory: PendingDirectorySnapshot,
-    recursive: boolean,
+    watch: WatchState,
     budget: SnapshotCollectionBudget,
     nextRequests: PendingDirectoryRequest[],
-  ): void {
+  ): boolean {
+    let complete = true;
     for (const child of directory.contents.content) {
-      if (budget.entryCount >= this.watchConfig.maxSnapshotEntries) {
-        return;
-      }
       const childUri = this.vs.Uri.joinPath(directory.uri, child.name);
       const childType = toFileType(this.vs, child.type);
+      const shouldDescend =
+        watch.recursive && childType === this.vs.FileType.Directory;
+      if (budget.entryCount >= this.watchConfig.maxSnapshotEntries) {
+        return false;
+      }
       snapshot.set(childUri.toString(), {
         uri: childUri,
         type: childType,
@@ -1085,16 +1160,19 @@ export class ContentsFileSystemProvider
       });
       budget.entryCount += 1;
       if (
-        recursive &&
+        shouldDescend &&
         directory.remainingDepth > 0 &&
-        childType === this.vs.FileType.Directory
+        budget.entryCount < this.watchConfig.maxSnapshotEntries
       ) {
         nextRequests.push({
           uri: childUri,
           remainingDepth: directory.remainingDepth - 1,
         });
+      } else if (shouldDescend) {
+        complete = false;
       }
     }
+    return complete;
   }
 
   private async getContentMetadata(
@@ -1130,7 +1208,32 @@ export class ContentsFileSystemProvider
     return contents;
   }
 
-  private buildWatchKey(uri: Uri, recursive: boolean): string {
+  private async getOptionalDirectoryContents(
+    client: ContentsApi,
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<DirectoryContents | undefined> {
+    try {
+      const contents = await client.get(
+        {
+          path,
+          type: ContentsGetTypeEnum.Directory,
+        },
+        { signal },
+      );
+      return isDirectoryContents(contents) ? contents : undefined;
+    } catch (error: unknown) {
+      if (error instanceof ResponseError && error.response.status === 404) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  private buildWatchKey(
+    uri: Uri,
+    recursive: boolean,
+  ): string {
     return `${uri.toString()}::${recursive ? 'recursive' : 'direct'}`;
   }
 
