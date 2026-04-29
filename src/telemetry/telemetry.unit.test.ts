@@ -8,7 +8,10 @@ import { expect } from 'chai';
 import sinon, { SinonSpy, SinonFakeTimers } from 'sinon';
 import vscode from 'vscode';
 import { Disposable } from 'vscode';
-import { AuthType } from '../colab/api';
+import {
+  AuthType,
+  SubscriptionTier as ColabSubscriptionTier,
+} from '../colab/api';
 import { COLAB_EXT_IDENTIFIER } from '../config/constants';
 import { JUPYTER_EXT_IDENTIFIER } from '../jupyter/jupyter-extension';
 import { newVsCodeStub, VsCodeStub } from '../test/helpers/vscode';
@@ -19,8 +22,10 @@ import {
   AuthFlow,
   ContentBrowserOperation,
   ContentBrowserTarget,
+  LowBalanceSeverity,
   NotebookSource,
   Outcome,
+  SubscriptionTier,
 } from './api';
 import { ClearcutClient } from './client';
 import { initializeTelemetry, telemetry } from '.';
@@ -323,6 +328,42 @@ describe('Telemetry Module', () => {
         },
       });
     });
+
+    const subscriptionTierCases: {
+      tier: ColabSubscriptionTier;
+      expected: SubscriptionTier;
+    }[] = [
+      {
+        tier: ColabSubscriptionTier.NONE,
+        expected: SubscriptionTier.SUBSCRIPTION_TIER_NONE,
+      },
+      {
+        tier: ColabSubscriptionTier.PRO,
+        expected: SubscriptionTier.SUBSCRIPTION_TIER_PRO,
+      },
+      {
+        tier: ColabSubscriptionTier.PRO_PLUS,
+        expected: SubscriptionTier.SUBSCRIPTION_TIER_PRO_PLUS,
+      },
+    ];
+    for (const { tier, expected } of subscriptionTierCases) {
+      it(`logs on low CCU notification for SubscriptionTier.${ColabSubscriptionTier[tier]}`, () => {
+        telemetry.logLowCcuNotification(
+          LowBalanceSeverity.SEVERITY_LOW,
+          tier,
+          false,
+        );
+
+        sinon.assert.calledOnceWithExactly(logStub, {
+          ...baseLog,
+          low_ccu_notification_event: {
+            severity: LowBalanceSeverity.SEVERITY_LOW,
+            subscription_tier: expected,
+            clicked_action: false,
+          },
+        });
+      });
+    }
 
     it('logs on mount Drive snippet', () => {
       const source = CommandSource.COMMAND_SOURCE_COMMAND_PALETTE;
