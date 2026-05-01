@@ -8,15 +8,24 @@ import { expect } from 'chai';
 import sinon, { SinonSpy, SinonFakeTimers } from 'sinon';
 import vscode from 'vscode';
 import { Disposable } from 'vscode';
-import { AuthType } from '../colab/api';
+import {
+  AuthType,
+  SubscriptionTier as ColabSubscriptionTier,
+} from '../colab/api';
 import { COLAB_EXT_IDENTIFIER } from '../config/constants';
 import { JUPYTER_EXT_IDENTIFIER } from '../jupyter/jupyter-extension';
 import { newVsCodeStub, VsCodeStub } from '../test/helpers/vscode';
 import {
   ColabLogEventBase,
   CommandSource,
+  AssignmentOutcome,
   AuthFlow,
+  ContentBrowserOperation,
+  ContentBrowserTarget,
+  LowBalanceSeverity,
   NotebookSource,
+  Outcome,
+  SubscriptionTier,
 } from './api';
 import { ClearcutClient } from './client';
 import { initializeTelemetry, telemetry } from '.';
@@ -216,11 +225,27 @@ describe('Telemetry Module', () => {
     });
 
     it('logs on server assignment', () => {
-      telemetry.logAssignServer();
+      telemetry.logAssignServer(
+        AssignmentOutcome.ASSIGNMENT_OUTCOME_SUCCEEDED,
+        {
+          variant: 'GPU',
+          accelerator: 'T4',
+          shape: 'STANDARD',
+          version: '',
+          hadFallback: false,
+        },
+      );
 
       sinon.assert.calledOnceWithExactly(logStub, {
         ...baseLog,
-        assign_server_event: {},
+        assign_server_event: {
+          outcome: AssignmentOutcome.ASSIGNMENT_OUTCOME_SUCCEEDED,
+          variant: 'GPU',
+          accelerator: 'T4',
+          shape: 'STANDARD',
+          version: '',
+          had_fallback: false,
+        },
       });
     });
 
@@ -275,6 +300,71 @@ describe('Telemetry Module', () => {
       });
     });
 
+    it('logs on content browser file operation', () => {
+      telemetry.logContentBrowserFileOperation(
+        ContentBrowserOperation.OPERATION_DELETE,
+        Outcome.OUTCOME_SUCCEEDED,
+        ContentBrowserTarget.TARGET_DIRECTORY,
+      );
+
+      sinon.assert.calledOnceWithExactly(logStub, {
+        ...baseLog,
+        content_browser_file_operation_event: {
+          operation: ContentBrowserOperation.OPERATION_DELETE,
+          outcome: Outcome.OUTCOME_SUCCEEDED,
+          target: ContentBrowserTarget.TARGET_DIRECTORY,
+        },
+      });
+    });
+
+    it('logs on download', () => {
+      telemetry.logDownload(Outcome.OUTCOME_SUCCEEDED, 2048);
+
+      sinon.assert.calledOnceWithExactly(logStub, {
+        ...baseLog,
+        download_event: {
+          outcome: Outcome.OUTCOME_SUCCEEDED,
+          downloaded_bytes: 2048,
+        },
+      });
+    });
+
+    const subscriptionTierCases: {
+      tier: ColabSubscriptionTier;
+      expected: SubscriptionTier;
+    }[] = [
+      {
+        tier: ColabSubscriptionTier.NONE,
+        expected: SubscriptionTier.SUBSCRIPTION_TIER_NONE,
+      },
+      {
+        tier: ColabSubscriptionTier.PRO,
+        expected: SubscriptionTier.SUBSCRIPTION_TIER_PRO,
+      },
+      {
+        tier: ColabSubscriptionTier.PRO_PLUS,
+        expected: SubscriptionTier.SUBSCRIPTION_TIER_PRO_PLUS,
+      },
+    ];
+    for (const { tier, expected } of subscriptionTierCases) {
+      it(`logs on low CCU notification for SubscriptionTier.${ColabSubscriptionTier[tier]}`, () => {
+        telemetry.logLowCcuNotification(
+          LowBalanceSeverity.SEVERITY_LOW,
+          tier,
+          false,
+        );
+
+        sinon.assert.calledOnceWithExactly(logStub, {
+          ...baseLog,
+          low_ccu_notification_event: {
+            severity: LowBalanceSeverity.SEVERITY_LOW,
+            subscription_tier: expected,
+            clicked_action: false,
+          },
+        });
+      });
+    }
+
     it('logs on mount Drive snippet', () => {
       const source = CommandSource.COMMAND_SOURCE_COMMAND_PALETTE;
 
@@ -320,6 +410,17 @@ describe('Telemetry Module', () => {
       });
     });
 
+    it('logs on open terminal', () => {
+      const source = CommandSource.COMMAND_SOURCE_TREE_VIEW_INLINE;
+
+      telemetry.logOpenTerminal(source);
+
+      sinon.assert.calledOnceWithExactly(logStub, {
+        ...baseLog,
+        open_terminal_event: { source },
+      });
+    });
+
     it('logs on upgrade to pro', () => {
       const source = CommandSource.COMMAND_SOURCE_COLAB_TOOLBAR;
 
@@ -351,6 +452,31 @@ describe('Telemetry Module', () => {
       sinon.assert.calledOnceWithExactly(logStub, {
         ...baseLog,
         import_notebook_event: { source, notebook_source: notebookSource },
+      });
+    });
+
+    it('logs on upload', () => {
+      const source = CommandSource.COMMAND_SOURCE_EXPLORER_CONTEXT;
+
+      telemetry.logUpload(source, Outcome.OUTCOME_PARTIAL_SUCCESS, {
+        successCount: 3,
+        failCount: 1,
+        fileCount: 4,
+        directoryCount: 2,
+        uploadedBytes: 1024,
+      });
+
+      sinon.assert.calledOnceWithExactly(logStub, {
+        ...baseLog,
+        upload_event: {
+          source,
+          outcome: Outcome.OUTCOME_PARTIAL_SUCCESS,
+          success_count: 3,
+          fail_count: 1,
+          file_count: 4,
+          directory_count: 2,
+          uploaded_bytes: 1024,
+        },
       });
     });
   });

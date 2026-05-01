@@ -6,7 +6,10 @@
 import assert from 'assert';
 import vscode from 'vscode';
 import { Disposable } from 'vscode';
-import { AuthType } from '../colab/api';
+import {
+  AuthType,
+  SubscriptionTier as ColabSubscriptionTier,
+} from '../colab/api';
 import { COLAB_EXT_IDENTIFIER } from '../config/constants';
 import { getPackageInfo } from '../config/package-info';
 import { JUPYTER_EXT_IDENTIFIER } from '../jupyter/jupyter-extension';
@@ -14,8 +17,14 @@ import {
   ColabLogEventBase,
   ColabEvent,
   CommandSource,
+  AssignmentOutcome,
   AuthFlow,
+  ContentBrowserOperation,
+  ContentBrowserTarget,
+  LowBalanceSeverity,
   NotebookSource,
+  Outcome,
+  SubscriptionTier,
 } from './api';
 import { ClearcutClient } from './client';
 
@@ -73,11 +82,56 @@ export const telemetry = {
   logAutoConnect: () => {
     log({ auto_connect_event: {} });
   },
-  logAssignServer: () => {
-    log({ assign_server_event: {} });
+  logAssignServer: (
+    outcome: AssignmentOutcome,
+    config: {
+      variant: string;
+      accelerator: string;
+      shape: string;
+      version: string;
+      hadFallback: boolean;
+    },
+  ) => {
+    log({
+      assign_server_event: {
+        outcome,
+        variant: config.variant,
+        accelerator: config.accelerator,
+        shape: config.shape,
+        version: config.version,
+        had_fallback: config.hadFallback,
+      },
+    });
   },
   logColabToolbar: () => {
     log({ colab_toolbar_event: {} });
+  },
+  logContentBrowserFileOperation: (
+    operation: ContentBrowserOperation,
+    outcome: Outcome,
+    target: ContentBrowserTarget,
+  ) => {
+    log({
+      content_browser_file_operation_event: { operation, outcome, target },
+    });
+  },
+  logDownload: (outcome: Outcome, downloadedBytes: number) => {
+    log({
+      download_event: { outcome, downloaded_bytes: downloadedBytes },
+    });
+  },
+  logLowCcuNotification: (
+    severity: LowBalanceSeverity,
+    subscriptionTier: ColabSubscriptionTier,
+    clickedAction: boolean,
+  ) => {
+    log({
+      low_ccu_notification_event: {
+        severity,
+        subscription_tier: toTelemetrySubscriptionTier(subscriptionTier),
+        clicked_action: clickedAction,
+      },
+    });
   },
   logError: (e: unknown) => {
     if (e instanceof Error) {
@@ -109,6 +163,9 @@ export const telemetry = {
   logOpenColabWeb: (source: CommandSource) => {
     log({ open_colab_web_event: { source } });
   },
+  logOpenTerminal: (source: CommandSource) => {
+    log({ open_terminal_event: { source } });
+  },
   logPruneServers: (servers: string[]) => {
     log({ prune_servers_event: { servers } });
   },
@@ -128,6 +185,29 @@ export const telemetry = {
   logUpgradeToPro: (source: CommandSource) => {
     log({ upgrade_to_pro_event: { source } });
   },
+  logUpload: (
+    source: CommandSource,
+    outcome: Outcome,
+    stats: {
+      successCount: number;
+      failCount: number;
+      fileCount: number;
+      directoryCount: number;
+      uploadedBytes: number;
+    },
+  ) => {
+    log({
+      upload_event: {
+        source,
+        outcome,
+        success_count: stats.successCount,
+        fail_count: stats.failCount,
+        file_count: stats.fileCount,
+        directory_count: stats.directoryCount,
+        uploaded_bytes: stats.uploadedBytes,
+      },
+    });
+  },
 };
 
 function log(event: ColabEvent) {
@@ -140,4 +220,17 @@ function log(event: ColabEvent) {
     ...event,
     timestamp: new Date().toISOString(),
   });
+}
+
+function toTelemetrySubscriptionTier(
+  tier: ColabSubscriptionTier,
+): SubscriptionTier {
+  switch (tier) {
+    case ColabSubscriptionTier.NONE:
+      return SubscriptionTier.SUBSCRIPTION_TIER_NONE;
+    case ColabSubscriptionTier.PRO:
+      return SubscriptionTier.SUBSCRIPTION_TIER_PRO;
+    case ColabSubscriptionTier.PRO_PLUS:
+      return SubscriptionTier.SUBSCRIPTION_TIER_PRO_PLUS;
+  }
 }

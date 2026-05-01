@@ -59,6 +59,18 @@ export type ColabEvent =
       colab_toolbar_event: ColabToolbarEvent;
     }
   | {
+      /** An event representing a content browser file or folder operation. */
+      content_browser_file_operation_event: ContentBrowserFileOperationEvent;
+    }
+  | {
+      /** An event representing a file download from a Colab server. */
+      download_event: DownloadEvent;
+    }
+  | {
+      /** An event representing a low/depleted CCU balance notification. */
+      low_ccu_notification_event: LowCcuNotificationEvent;
+    }
+  | {
       /** An event representing an error. */
       error_event: ErrorEvent;
     }
@@ -83,6 +95,10 @@ export type ColabEvent =
       open_colab_web_event: OpenColabWebEvent;
     }
   | {
+      /** An event representing opening a terminal connected to a Colab server. */
+      open_terminal_event: OpenTerminalEvent;
+    }
+  | {
       /** An event that logs when servers are pruned */
       prune_servers_event: PruneServersEvent;
     }
@@ -101,6 +117,10 @@ export type ColabEvent =
   | {
       /** An event representing a click to upgrade to Colab Pro. */
       upgrade_to_pro_event: UpgradeToProEvent;
+    }
+  | {
+      /** An event representing an upload of files or folders to a server. */
+      upload_event: UploadEvent;
     };
 
 /** Enum to represent different command sources/triggers */
@@ -111,12 +131,78 @@ export enum CommandSource {
   COMMAND_SOURCE_COMMAND_PALETTE = 3,
   COMMAND_SOURCE_NOTIFICATION = 4,
   COMMAND_SOURCE_ON_URI = 5,
+  COMMAND_SOURCE_EXPLORER_CONTEXT = 6,
+  COMMAND_SOURCE_TREE_VIEW_INLINE = 7,
 }
 
 /** Enum to represent different notebook sources */
 export enum NotebookSource {
   NOTEBOOK_SOURCE_UNSPECIFIED = 0,
   NOTEBOOK_SOURCE_DRIVE = 1,
+}
+
+/**
+ * The outcome of a user-initiated operation. Shared across events that have a
+ * success/failure/cancel lifecycle.
+ */
+export enum Outcome {
+  OUTCOME_UNSPECIFIED = 0,
+  /** The operation completed successfully. */
+  OUTCOME_SUCCEEDED = 1,
+  /**
+   * The user cancelled the operation before any work was attempted (e.g.,
+   * dismissed a prompt) or the operation was a no-op.
+   */
+  OUTCOME_CANCELLED = 2,
+  /** The operation was attempted but failed. */
+  OUTCOME_FAILED = 3,
+  /**
+   * The operation was attempted and partially succeeded; some work units
+   * succeeded and some failed. Applicable to events that operate on a batch
+   * of items (e.g., uploads).
+   */
+  OUTCOME_PARTIAL_SUCCESS = 4,
+}
+
+/** The kind of file operation performed in the content browser tree view. */
+export enum ContentBrowserOperation {
+  OPERATION_UNSPECIFIED = 0,
+  OPERATION_NEW_FILE = 1,
+  OPERATION_NEW_FOLDER = 2,
+  OPERATION_RENAME = 3,
+  OPERATION_DELETE = 4,
+}
+
+/** The kind of target a content browser file operation was performed on. */
+export enum ContentBrowserTarget {
+  TARGET_UNSPECIFIED = 0,
+  TARGET_FILE = 1,
+  TARGET_DIRECTORY = 2,
+}
+
+/** The severity of a Colab Compute Units (CCU) low balance notification. */
+export enum LowBalanceSeverity {
+  SEVERITY_UNSPECIFIED = 0,
+  /**
+   * Balance is low (less than 30 minutes of compute remaining at the current
+   * consumption rate); shown as a warning.
+   */
+  SEVERITY_LOW = 1,
+  /** Balance is fully depleted; shown as an error. */
+  SEVERITY_DEPLETED = 2,
+}
+
+/**
+ * The user's Colab subscription tier as recorded in telemetry. Mirrors the
+ * top-level `SubscriptionTier` proto enum. Distinct from
+ * `colab/api.SubscriptionTier`, which uses unprefixed values (`NONE`,
+ * `PRO`, `PRO_PLUS`).
+ */
+export enum SubscriptionTier {
+  SUBSCRIPTION_TIER_UNSPECIFIED = 0,
+  SUBSCRIPTION_TIER_NONE = 1,
+  SUBSCRIPTION_TIER_PRO = 2,
+  SUBSCRIPTION_TIER_PRO_PLUS = 3,
 }
 
 // The authentication flow used for sign in.
@@ -131,14 +217,104 @@ export enum AuthFlow {
 /** An event representing extension activation. */
 type ActivationEvent = Record<string, never>;
 
-/** An event representing a server assignment */
-type AssignServerEvent = Record<string, never>;
+/** The final outcome of a server assignment attempt. */
+export enum AssignmentOutcome {
+  ASSIGNMENT_OUTCOME_UNSPECIFIED = 0,
+  ASSIGNMENT_OUTCOME_SUCCEEDED = 1,
+  /**
+   * The requested accelerator was unavailable and no fallback was attempted
+   * (e.g., the user explicitly requested a CPU server).
+   */
+  ASSIGNMENT_OUTCOME_ACCELERATOR_UNAVAILABLE = 2,
+  /**
+   * The requested accelerator was unavailable and the fallback chain was
+   * exhausted.
+   */
+  ASSIGNMENT_OUTCOME_ALL_ACCELERATORS_UNAVAILABLE = 3,
+  /** The user already has the maximum number of assignments. */
+  ASSIGNMENT_OUTCOME_TOO_MANY_ASSIGNMENTS = 4,
+  /**
+   * The user does not have enough quota to be assigned the requested
+   * configuration.
+   */
+  ASSIGNMENT_OUTCOME_INSUFFICIENT_QUOTA = 5,
+  /** The user is denylisted from being assigned a server. */
+  ASSIGNMENT_OUTCOME_DENYLISTED = 6,
+  /** Catch-all for unexpected failures. */
+  ASSIGNMENT_OUTCOME_OTHER_FAILURE = 7,
+}
+
+/** An event representing a server assignment attempt. */
+interface AssignServerEvent {
+  /** The final outcome of the assignment attempt. */
+  outcome: AssignmentOutcome;
+  /** The variant of the requested machine type (e.g. "DEFAULT", "GPU", "TPU"). */
+  variant: string;
+  /** The requested accelerator (e.g. "T4", "L4"). Empty when none. */
+  accelerator: string;
+  /**
+   * The requested machine shape ("STANDARD", "HIGHMEM"). Empty when not
+   * applicable.
+   */
+  shape: string;
+  /** The version of the requested runtime image. Empty when not specified. */
+  version: string;
+  /**
+   * Whether one or more fallback accelerators were attempted before reaching
+   * the final outcome.
+   */
+  had_fallback: boolean;
+}
 
 /** An event representing a server auto connection */
 type AutoConnectEvent = Record<string, never>;
 
 /** An event representing a Colab toolbar click. */
 type ColabToolbarEvent = Record<string, never>;
+
+/** An event representing a content browser file or folder operation. */
+interface ContentBrowserFileOperationEvent {
+  /** The kind of file operation that was attempted. */
+  operation: ContentBrowserOperation;
+  /**
+   * The outcome of the operation. `OUTCOME_CANCELLED` covers both the user
+   * dismissing the input box and declining the delete confirmation.
+   */
+  outcome: Outcome;
+  /**
+   * The kind of target the operation was performed on. For
+   * `OPERATION_NEW_FOLDER` this is always `TARGET_DIRECTORY`. For
+   * `OPERATION_NEW_FILE` it reflects whether the user typed a trailing slash
+   * to create a folder instead. For `OPERATION_RENAME` and
+   * `OPERATION_DELETE` it reflects the actual target type.
+   */
+  target: ContentBrowserTarget;
+}
+
+/** An event representing a file download from a Colab server. */
+interface DownloadEvent {
+  /**
+   * The outcome of the download. `OUTCOME_CANCELLED` covers both the user
+   * dismissing the save dialog and the target item not being a file.
+   */
+  outcome: Outcome;
+  /** The size, in bytes, of the file that was successfully downloaded. */
+  downloaded_bytes: number;
+}
+
+/** An event representing a low/depleted CCU balance notification. */
+interface LowCcuNotificationEvent {
+  /** The severity level of the notification. */
+  severity: LowBalanceSeverity;
+  /** The user's subscription tier when the notification was shown. */
+  subscription_tier: SubscriptionTier;
+  /**
+   * Whether the user clicked the call-to-action (e.g., "Sign Up for Colab",
+   * "Upgrade to Pro+", "Purchase More CCUs"). False if the notification was
+   * dismissed without taking action.
+   */
+  clicked_action: boolean;
+}
 
 /** An event representing an error. */
 interface ErrorEvent {
@@ -177,6 +353,11 @@ interface OpenColabWebEvent {
   source: CommandSource;
 }
 
+/** An event representing opening a terminal connected to a Colab server. */
+interface OpenTerminalEvent {
+  source: CommandSource;
+}
+
 /** An event representing server pruning */
 interface PruneServersEvent {
   servers: string[];
@@ -201,6 +382,29 @@ type SignOutEvent = Record<string, never>;
 /** An event representing a click to upgrade to Colab Pro. */
 interface UpgradeToProEvent {
   source: CommandSource;
+}
+
+/** An event representing an upload of files or folders to a Colab server. */
+interface UploadEvent {
+  /** The source of the upload command. */
+  source: CommandSource;
+  /**
+   * The outcome of the upload. `OUTCOME_CANCELLED` covers both the user
+   * dismissing the server picker and there being no servers assigned.
+   * `OUTCOME_PARTIAL_SUCCESS` is used when at least one file uploaded
+   * successfully and at least one other file or directory failed.
+   */
+  outcome: Outcome;
+  /** The number of files that were successfully uploaded. */
+  success_count: number;
+  /** The number of files or directories that failed to upload. */
+  fail_count: number;
+  /** The total number of files (excluding directories) that were attempted. */
+  file_count: number;
+  /** The total number of directories that were attempted. */
+  directory_count: number;
+  /** The total size, in bytes, of all files that were successfully uploaded. */
+  uploaded_bytes: number;
 }
 
 /** The Clearcut log event structure. */
